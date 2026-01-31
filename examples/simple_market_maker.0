@@ -1,0 +1,88 @@
+# Simple Market Maker Example
+#
+# This is a placeholder for a binary .0 graph file.
+# In the actual implementation, this would be a Cap'n Proto
+# serialized DAG containing the market making logic.
+#
+# Human-readable debug representation:
+#
+# Graph {
+#     version: 1,
+#     entry_point: "get_ticker",
+#     outputs: ["place_orders"],
+#     
+#     nodes: [
+#         # Node 1: Get current ticker price
+#         {
+#             id: sha256("get_ticker"),
+#             type: External,
+#             uri: "http:get:binance:/api/v3/ticker/price?symbol=BTCUSDT"
+#         },
+#         
+#         # Node 2: Parse mid price from JSON
+#         {
+#             id: sha256("parse_mid"),
+#             type: Operation,
+#             op: JsonGet,
+#             inputs: ["get_ticker"],
+#             path: "price"
+#         },
+#         
+#         # Node 3: Calculate spread (1% of mid price)
+#         {
+#             id: sha256("spread"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.01], confidence: 1.0 }
+#         },
+#         
+#         # Node 4: Calculate bid price (mid - spread/2)
+#         {
+#             id: sha256("calc_bid"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["parse_mid", "half_spread"]
+#         },
+#         
+#         # Node 5: Calculate ask price (mid + spread/2)
+#         {
+#             id: sha256("calc_ask"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["parse_mid", "half_spread"]
+#         },
+#         
+#         # Node 6: Check confidence threshold
+#         {
+#             id: sha256("confidence_check"),
+#             type: Branch,
+#             condition: "parse_mid",  # Check if data was received
+#             threshold: 0.8,
+#             true_branch: "place_orders",
+#             false_branch: "skip"
+#         },
+#         
+#         # Node 7: Place bid and ask orders
+#         {
+#             id: sha256("place_orders"),
+#             type: External,
+#             uri: "http:post:binance:/api/v3/order",
+#             inputs: ["calc_bid", "calc_ask"]
+#         },
+#         
+#         # Node 8: Skip (no-op)
+#         {
+#             id: sha256("skip"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         }
+#     ],
+#     
+#     proofs: [
+#         HaltingProof { max_steps: 100, fuel_budget: 1000 }
+#     ]
+# }
+#
+# To generate the actual binary .0 file:
+#   cargo run --bin zero -- generate examples/simple_market_maker.0
+
+# Binary content would go here (this is a placeholder)
