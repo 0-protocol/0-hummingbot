@@ -1,0 +1,205 @@
+# Binance Exchange Connector
+#
+# This is a placeholder for the binary .0 graph file.
+# Human-readable debug representation of the Binance connector graph.
+#
+# The connector provides subgraphs for:
+# - Getting ticker prices
+# - Getting orderbook
+# - Placing orders
+# - Cancelling orders
+# - Getting account info
+#
+# ============================================================================
+# GET TICKER GRAPH
+# ============================================================================
+#
+# Graph {
+#     name: "binance_get_ticker",
+#     version: 1,
+#     
+#     nodes: [
+#         # Input: Symbol (e.g., "BTCUSDT" encoded as tensor)
+#         {
+#             id: sha256("input_symbol"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#             # Placeholder - actual symbol passed at runtime
+#         },
+#         
+#         # External HTTP call to Binance API
+#         {
+#             id: sha256("http_get_ticker"),
+#             type: External,
+#             uri: "http:get:binance:/api/v3/ticker/price?symbol=BTCUSDT",
+#             inputs: ["input_symbol"]
+#         },
+#         
+#         # Parse JSON response - extract price field
+#         {
+#             id: sha256("parse_price"),
+#             type: Operation,
+#             op: Identity,  # In future: JsonGet
+#             inputs: ["http_get_ticker"]
+#             # Returns: Tensor { shape: [1], data: [price], confidence: http_confidence }
+#         }
+#     ],
+#     
+#     outputs: ["parse_price"],
+#     
+#     proofs: [
+#         HaltingProof { max_steps: 10, fuel_budget: 100 }
+#     ]
+# }
+#
+# ============================================================================
+# GET ORDERBOOK GRAPH
+# ============================================================================
+#
+# Graph {
+#     name: "binance_get_orderbook",
+#     version: 1,
+#     
+#     nodes: [
+#         # Input: Symbol
+#         {
+#             id: sha256("input_symbol"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         
+#         # Input: Depth limit
+#         {
+#             id: sha256("input_limit"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [10.0], confidence: 1.0 }
+#         },
+#         
+#         # External HTTP call
+#         {
+#             id: sha256("http_get_orderbook"),
+#             type: External,
+#             uri: "http:get:binance:/api/v3/depth?symbol=BTCUSDT&limit=10",
+#             inputs: ["input_symbol", "input_limit"]
+#         },
+#         
+#         # Parse bids
+#         {
+#             id: sha256("parse_bids"),
+#             type: Operation,
+#             op: Identity,
+#             inputs: ["http_get_orderbook"]
+#             # Returns: Tensor { shape: [limit, 2], data: [[price, qty], ...] }
+#         },
+#         
+#         # Parse asks
+#         {
+#             id: sha256("parse_asks"),
+#             type: Operation,
+#             op: Identity,
+#             inputs: ["http_get_orderbook"]
+#             # Returns: Tensor { shape: [limit, 2], data: [[price, qty], ...] }
+#         },
+#         
+#         # Combine into orderbook tensor
+#         {
+#             id: sha256("orderbook"),
+#             type: Operation,
+#             op: Concat,
+#             inputs: ["parse_bids", "parse_asks"]
+#         }
+#     ],
+#     
+#     outputs: ["orderbook"],
+#     
+#     proofs: [
+#         HaltingProof { max_steps: 20, fuel_budget: 200 }
+#     ]
+# }
+#
+# ============================================================================
+# PLACE ORDER GRAPH
+# ============================================================================
+#
+# Graph {
+#     name: "binance_place_order",
+#     version: 1,
+#     
+#     nodes: [
+#         # Inputs
+#         {
+#             id: sha256("input_symbol"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("input_side"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }  # 1.0 = BUY
+#         },
+#         {
+#             id: sha256("input_quantity"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.001], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("input_price"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [50000.0], confidence: 1.0 }
+#         },
+#         
+#         # Build order request
+#         {
+#             id: sha256("build_order"),
+#             type: Operation,
+#             op: Concat,
+#             inputs: ["input_symbol", "input_side", "input_quantity", "input_price"]
+#         },
+#         
+#         # External HTTP POST
+#         {
+#             id: sha256("http_post_order"),
+#             type: External,
+#             uri: "http:post:binance:/api/v3/order",
+#             inputs: ["build_order"]
+#         },
+#         
+#         # Parse response - get order ID
+#         {
+#             id: sha256("order_response"),
+#             type: Operation,
+#             op: Identity,
+#             inputs: ["http_post_order"]
+#         }
+#     ],
+#     
+#     outputs: ["order_response"],
+#     
+#     proofs: [
+#         HaltingProof { max_steps: 15, fuel_budget: 150 },
+#         StrategyProof {
+#             # Proof that this order was generated by a valid strategy
+#             strategy_hash: <strategy_graph_hash>,
+#             input_hash: <market_data_hash>
+#         }
+#     ]
+# }
+#
+# ============================================================================
+# ENCODING NOTES
+# ============================================================================
+#
+# Symbol Encoding:
+#   Symbols are encoded as ASCII tensors or hash references
+#   Example: "BTCUSDT" -> Tensor { shape: [7], data: [66,84,67,85,83,68,84] }
+#
+# Side Encoding:
+#   BUY = 1.0, SELL = -1.0
+#
+# Order Type Encoding:
+#   MARKET = 0.0, LIMIT = 1.0
+#
+# ============================================================================
+
+# Binary content placeholder
+# Generate with: zero generate graphs/connectors/binance.0
