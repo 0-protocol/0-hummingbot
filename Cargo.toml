@@ -10,12 +10,21 @@ repository = "https://github.com/0-protocol/0-hummingbot"
 name = "0-hummingbot"
 path = "src/main.rs"
 
+[features]
+default = ["hyperliquid", "dydx", "jupiter"]
+hyperliquid = []
+dydx = []
+jupiter = []
+
 [dependencies]
 # 0-lang runtime
 zerolang = { path = "../0-lang" }
 
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+async-stream = "0.3"
+futures-util = "0.3"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json"] }
@@ -30,13 +39,38 @@ serde_json = "1.0"
 # CLI
 clap = { version = "4.5", features = ["derive"] }
 
-# Crypto
+# Crypto / Authentication
 sha2 = "0.10"
 hex = "0.4"
 hmac = "0.12"
+base64 = "0.22"
+rand = "0.8"
+ed25519-dalek = { version = "2.0", features = ["rand_core", "serde"] }
+
+# EVM (Hyperliquid) - using core components only
+ethers-core = "2.0"
+ethers-signers = "2.0"
+
+# Elliptic curve crypto (k256 = secp256k1)
+k256 = { version = "0.13", features = ["ecdsa"] }
+
+# Base58 encoding (for Solana addresses)
+bs58 = "0.5"
+
+# Note: solana-sdk has dependency conflicts with ethers (zeroize versions)
+# Jupiter connector will use HTTP API only without SDK for now
+
+# Cosmos encoding (dYdX v4)
+bech32 = "0.9"
 
 # Decimal precision for financial math
 rust_decimal = "1.36"
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "1.0"
 
 # Cap'n Proto (for schema)
 capnp = "0.20"

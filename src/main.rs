@@ -7,8 +7,12 @@ use std::path::PathBuf;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
+pub mod connectors;
+pub mod composer;
+pub mod pco;
 mod resolvers;
 mod runtime;
+pub mod wallet;
 
 /// 0-hummingbot: High-frequency crypto trading bot
 #[derive(Parser)]
@@ -198,11 +202,23 @@ fn list_strategies() {
     println!("│  AVAILABLE STRATEGIES                                       │");
     println!("├─────────────────────────────────────────────────────────────┤");
     println!("│                                                             │");
-    println!("│  Strategy         │ Status      │ Path                      │");
-    println!("│  ─────────────────┼─────────────┼───────────────────────── │");
-    println!("│  market_making    │ In Progress │ graphs/strategies/       │");
-    println!("│  arbitrage        │ Planned     │ graphs/strategies/       │");
-    println!("│  grid_trading     │ Planned     │ graphs/strategies/       │");
+    println!("│  Market Making:                                             │");
+    println!("│  ├─ pure_mm.0        │ Basic spread-based market making     │");
+    println!("│  ├─ avellaneda_mm.0  │ Optimal MM (Avellaneda-Stoikov)     │");
+    println!("│  └─ grid_mm.0        │ Grid trading strategy                │");
+    println!("│                                                             │");
+    println!("│  Arbitrage:                                                 │");
+    println!("│  └─ cross_arb.0      │ Cross-exchange arbitrage             │");
+    println!("│                                                             │");
+    println!("│  Execution:                                                 │");
+    println!("│  ├─ twap.0           │ Time-weighted average price          │");
+    println!("│  ├─ vwap.0           │ Volume-weighted average price        │");
+    println!("│  └─ iceberg.0        │ Hidden large order execution         │");
+    println!("│                                                             │");
+    println!("│  Components:                                                │");
+    println!("│  ├─ risk_check.0     │ Reusable risk validation             │");
+    println!("│  ├─ position_mgr.0   │ Position & P&L tracking              │");
+    println!("│  └─ order_exec.0     │ Order execution handler              │");
     println!("│                                                             │");
     println!("└─────────────────────────────────────────────────────────────┘");
 }
@@ -212,11 +228,13 @@ fn list_connectors() {
     println!("│  AVAILABLE CONNECTORS                                       │");
     println!("├─────────────────────────────────────────────────────────────┤");
     println!("│                                                             │");
-    println!("│  Exchange     │ Type │ Status      │ Path                   │");
-    println!("│  ─────────────┼──────┼─────────────┼────────────────────── │");
-    println!("│  binance      │ CEX  │ In Progress │ graphs/connectors/    │");
-    println!("│  okx          │ CEX  │ Planned     │ graphs/connectors/    │");
-    println!("│  hyperliquid  │ DEX  │ Planned     │ graphs/connectors/    │");
+    println!("│  Exchange     │ Type │ Chain   │ Status      │ Module      │");
+    println!("│  ─────────────┼──────┼─────────┼─────────────┼──────────── │");
+    println!("│  binance      │ CEX  │ N/A     │ In Progress │ resolvers   │");
+    println!("│  hyperliquid  │ DEX  │ Arbitrum│ Ready       │ connectors  │");
+    println!("│  dydx         │ DEX  │ Cosmos  │ Ready       │ connectors  │");
+    println!("│  jupiter      │ DEX  │ Solana  │ Ready       │ connectors  │");
+    println!("│  okx          │ CEX  │ N/A     │ Planned     │ connectors  │");
     println!("│                                                             │");
     println!("└─────────────────────────────────────────────────────────────┘");
 }
