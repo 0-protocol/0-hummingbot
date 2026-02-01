@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
+pub mod composer;
+pub mod pco;
 mod resolvers;
 mod runtime;
 
