@@ -1,0 +1,221 @@
+# Cross-Exchange Arbitrage Strategy
+#
+# Detects price differences between exchanges and executes
+# simultaneous buy/sell orders to capture the spread.
+#
+# ============================================================================
+# STRATEGY OVERVIEW
+# ============================================================================
+#
+# Arbitrage exploits price inefficiencies between exchanges.
+# When BTC is $50,000 on Binance and $50,100 on OKX:
+#   - Buy on Binance
+#   - Sell on OKX
+#   - Profit: $100 minus fees
+#
+# Key Parameters:
+#   - min_spread: 0.1% (minimum profitable spread after fees)
+#   - order_size: 0.01 BTC
+#   - exchanges: [Binance, OKX]
+#
+# ============================================================================
+# GRAPH DEFINITION
+# ============================================================================
+#
+# Graph {
+#     name: "arbitrage_v1",
+#     version: 1,
+#     description: "Cross-exchange arbitrage detector and executor",
+#     
+#     nodes: [
+#         # =========== CONFIGURATION ===========
+#         
+#         {
+#             id: sha256("config_min_spread"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.001], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("config_order_size"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.01], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("config_fee_rate"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0004], confidence: 1.0 }  # 0.04% per trade
+#         },
+#         
+#         # =========== MARKET DATA ===========
+#         
+#         # Get price from Binance
+#         {
+#             id: sha256("binance_price"),
+#             type: External,
+#             uri: "binance:ticker:BTCUSDT",
+#             inputs: []
+#         },
+#         
+#         # Get price from OKX
+#         {
+#             id: sha256("okx_price"),
+#             type: External,
+#             uri: "okx:ticker:BTCUSDT",
+#             inputs: []
+#         },
+#         
+#         # =========== SPREAD CALCULATION ===========
+#         
+#         # Calculate spread: (high - low) / low
+#         {
+#             id: sha256("price_diff"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["okx_price", "binance_price"]
+#         },
+#         {
+#             id: sha256("spread"),
+#             type: Operation,
+#             op: Div,
+#             inputs: ["price_diff", "binance_price"]
+#         },
+#         
+#         # =========== PROFITABILITY CHECK ===========
+#         
+#         # Calculate total fees (buy + sell)
+#         {
+#             id: sha256("total_fees"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0008], confidence: 1.0 }  # 2 * 0.04%
+#         },
+#         
+#         # Net spread after fees
+#         {
+#             id: sha256("net_spread"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["spread", "total_fees"]
+#         },
+#         
+#         # Is it profitable?
+#         {
+#             id: sha256("is_profitable"),
+#             type: Operation,
+#             op: Gt,
+#             inputs: ["net_spread", "config_min_spread"]
+#         },
+#         
+#         # =========== DIRECTION DETECTION ===========
+#         
+#         # Which exchange to buy from? (the cheaper one)
+#         {
+#             id: sha256("binance_cheaper"),
+#             type: Operation,
+#             op: Lt,
+#             inputs: ["binance_price", "okx_price"]
+#         },
+#         
+#         # =========== ORDER EXECUTION ===========
+#         
+#         # Execute arbitrage if profitable
+#         {
+#             id: sha256("execute_arb"),
+#             type: Branch,
+#             condition: "is_profitable",
+#             threshold: 0.5,
+#             true_branch: "place_orders",
+#             false_branch: "no_op"
+#         },
+#         
+#         # Direction branch: buy on Binance, sell on OKX (or vice versa)
+#         {
+#             id: sha256("place_orders"),
+#             type: Branch,
+#             condition: "binance_cheaper",
+#             threshold: 0.5,
+#             true_branch: "buy_binance_sell_okx",
+#             false_branch: "buy_okx_sell_binance"
+#         },
+#         
+#         # Buy Binance, Sell OKX
+#         {
+#             id: sha256("buy_binance"),
+#             type: External,
+#             uri: "binance:order:symbol=BTCUSDT,side=BUY",
+#             inputs: ["binance_price", "config_order_size"]
+#         },
+#         {
+#             id: sha256("sell_okx"),
+#             type: External,
+#             uri: "okx:order:symbol=BTCUSDT,side=SELL",
+#             inputs: ["okx_price", "config_order_size"]
+#         },
+#         {
+#             id: sha256("buy_binance_sell_okx"),
+#             type: Operation,
+#             op: Concat,
+#             inputs: ["buy_binance", "sell_okx"]
+#         },
+#         
+#         # Buy OKX, Sell Binance
+#         {
+#             id: sha256("buy_okx"),
+#             type: External,
+#             uri: "okx:order:symbol=BTCUSDT,side=BUY",
+#             inputs: ["okx_price", "config_order_size"]
+#         },
+#         {
+#             id: sha256("sell_binance"),
+#             type: External,
+#             uri: "binance:order:symbol=BTCUSDT,side=SELL",
+#             inputs: ["binance_price", "config_order_size"]
+#         },
+#         {
+#             id: sha256("buy_okx_sell_binance"),
+#             type: Operation,
+#             op: Concat,
+#             inputs: ["buy_okx", "sell_binance"]
+#         },
+#         
+#         # No-op when not profitable
+#         {
+#             id: sha256("no_op"),
+#             type: Constant,
+#             value: Tensor { shape: [2], data: [0.0, 0.0], confidence: 1.0 }
+#         }
+#     ],
+#     
+#     entry_point: "binance_price",
+#     outputs: ["execute_arb"],
+#     
+#     proofs: [
+#         HaltingProof {
+#             max_steps: 30,
+#             fuel_budget: 300
+#         }
+#     ]
+# }
+#
+# ============================================================================
+# WHY 0-LANG EXCELS AT ARBITRAGE
+# ============================================================================
+#
+# 1. ATOMIC EXECUTION: Both orders in a single graph execution
+#    - No race conditions between buy and sell
+#    - Deterministic order placement
+#
+# 2. VERIFIABLE OPPORTUNITY: The spread calculation is provable
+#    - Auditors can verify the arbitrage was legitimate
+#    - No hidden logic or manipulation
+#
+# 3. MULTI-EXCHANGE NATIVE: External resolvers handle different APIs
+#    - Same graph structure regardless of exchange
+#    - Easy to add new exchanges
+#
+# 4. LATENCY OPTIMIZED: Graph compiled to binary, no interpretation
+#    - Faster execution than Python
+#    - Critical for time-sensitive arbitrage
+#
+# ============================================================================
+
+# Binary content placeholder

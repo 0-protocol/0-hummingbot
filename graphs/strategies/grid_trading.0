@@ -1,0 +1,158 @@
+# Grid Trading Strategy
+#
+# Places a grid of buy and sell orders at preset price levels.
+# Profits from price oscillation within a range.
+#
+# ============================================================================
+# STRATEGY OVERVIEW
+# ============================================================================
+#
+# Grid trading works best in ranging markets. It places:
+#   - Buy orders below current price at regular intervals
+#   - Sell orders above current price at regular intervals
+#
+# When price oscillates, orders get filled and create profit.
+#
+# Key Parameters:
+#   - grid_levels: 10 (5 above, 5 below)
+#   - grid_spacing: 1% between levels
+#   - order_size: 0.01 BTC per level
+#   - upper_bound: +5% from start price
+#   - lower_bound: -5% from start price
+#
+# ============================================================================
+# GRAPH DEFINITION
+# ============================================================================
+#
+# Graph {
+#     name: "grid_trading_v1",
+#     version: 1,
+#     description: "Grid trading with configurable levels and spacing",
+#     
+#     nodes: [
+#         # =========== CONFIGURATION ===========
+#         
+#         {
+#             id: sha256("config_num_levels"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [5.0], confidence: 1.0 }  # 5 each side
+#         },
+#         {
+#             id: sha256("config_grid_spacing"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.01], confidence: 1.0 }  # 1%
+#         },
+#         {
+#             id: sha256("config_order_size"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.01], confidence: 1.0 }
+#         },
+#         
+#         # Grid level multipliers (pre-computed)
+#         {
+#             id: sha256("grid_levels"),
+#             type: Constant,
+#             value: Tensor { 
+#                 shape: [10],
+#                 # -5%, -4%, -3%, -2%, -1%, +1%, +2%, +3%, +4%, +5%
+#                 data: [0.95, 0.96, 0.97, 0.98, 0.99, 1.01, 1.02, 1.03, 1.04, 1.05],
+#                 confidence: 1.0 
+#             }
+#         },
+#         
+#         # Order sides (0=buy, 1=sell)
+#         {
+#             id: sha256("grid_sides"),
+#             type: Constant,
+#             value: Tensor {
+#                 shape: [10],
+#                 # First 5 are buys (0), last 5 are sells (1)
+#                 data: [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+#                 confidence: 1.0
+#             }
+#         },
+#         
+#         # =========== MARKET DATA ===========
+#         
+#         {
+#             id: sha256("get_mid_price"),
+#             type: External,
+#             uri: "binance:ticker:BTCUSDT",
+#             inputs: []
+#         },
+#         
+#         # =========== GRID PRICE CALCULATION ===========
+#         
+#         # Calculate all grid prices: mid_price * grid_levels
+#         {
+#             id: sha256("grid_prices"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["get_mid_price", "grid_levels"]
+#             # Broadcasting: scalar * [10] = [10]
+#         },
+#         
+#         # =========== ORDER PLACEMENT ===========
+#         
+#         # Place grid orders
+#         # Note: In full implementation, this would be a loop or unrolled
+#         # Here we show the concept
+#         
+#         {
+#             id: sha256("place_grid_orders"),
+#             type: External,
+#             uri: "binance:batch_order:symbol=BTCUSDT",
+#             inputs: ["grid_prices", "grid_sides", "config_order_size"]
+#         }
+#     ],
+#     
+#     entry_point: "get_mid_price",
+#     outputs: ["place_grid_orders"],
+#     
+#     proofs: [
+#         HaltingProof {
+#             max_steps: 20,
+#             fuel_budget: 200
+#         }
+#     ]
+# }
+#
+# ============================================================================
+# GRID VISUALIZATION
+# ============================================================================
+#
+#   Price
+#     ▲
+#     │   +5% ────────────────── SELL ○
+#     │   +4% ────────────────── SELL ○
+#     │   +3% ────────────────── SELL ○
+#     │   +2% ────────────────── SELL ○
+#     │   +1% ────────────────── SELL ○
+#     │   ═══ MID PRICE ════════════════
+#     │   -1% ────────────────── BUY  ●
+#     │   -2% ────────────────── BUY  ●
+#     │   -3% ────────────────── BUY  ●
+#     │   -4% ────────────────── BUY  ●
+#     │   -5% ────────────────── BUY  ●
+#     │
+#     └──────────────────────────────────► Time
+#
+# ============================================================================
+# 0-LANG ADVANTAGES FOR GRID TRADING
+# ============================================================================
+#
+# 1. TENSOR-NATIVE: Grid levels stored as tensor, operations vectorized
+#    - Single multiplication computes all 10 grid prices
+#    - Efficient compared to Python loops
+#
+# 2. BATCH EXECUTION: All orders placed in single external call
+#    - Atomic grid placement
+#    - No partial grid states
+#
+# 3. DETERMINISTIC GRID: Same mid price always produces same grid
+#    - Reproducible for backtesting
+#    - Verifiable for auditing
+#
+# ============================================================================
+
+# Binary content placeholder

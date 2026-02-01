@@ -1,0 +1,281 @@
+# Market Making Strategy
+#
+# A simple market making strategy in 0-lang format.
+# This is a human-readable debug representation.
+# Actual binary format would be Cap'n Proto serialized.
+#
+# ============================================================================
+# STRATEGY OVERVIEW
+# ============================================================================
+#
+# Market making provides liquidity by placing both buy and sell orders
+# around the current market price. Profit comes from the spread between
+# bid and ask prices.
+#
+# Key Parameters:
+#   - spread: 0.5% (0.25% each side)
+#   - order_size: 0.01 BTC
+#   - confidence_threshold: 0.8
+#   - max_position: 0.1 BTC
+#
+# ============================================================================
+# GRAPH DEFINITION
+# ============================================================================
+#
+# Graph {
+#     name: "market_making_v1",
+#     version: 1,
+#     description: "Simple market making with spread control",
+#     
+#     # =========== CONFIGURATION CONSTANTS ===========
+#     
+#     nodes: [
+#         # Spread configuration (0.5% total, 0.25% each side)
+#         {
+#             id: sha256("config_spread"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0025], confidence: 1.0 }
+#         },
+#         
+#         # Order size (0.01 BTC)
+#         {
+#             id: sha256("config_order_size"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.01], confidence: 1.0 }
+#         },
+#         
+#         # Confidence threshold for order placement
+#         {
+#             id: sha256("config_confidence_threshold"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.8], confidence: 1.0 }
+#         },
+#         
+#         # Max position limit
+#         {
+#             id: sha256("config_max_position"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.1], confidence: 1.0 }
+#         },
+#         
+#         # =========== MARKET DATA ===========
+#         
+#         # Get current ticker from Binance
+#         {
+#             id: sha256("get_ticker"),
+#             type: External,
+#             uri: "binance:ticker:BTCUSDT",
+#             inputs: []
+#         },
+#         
+#         # Get current orderbook (top 5 levels)
+#         {
+#             id: sha256("get_orderbook"),
+#             type: External,
+#             uri: "binance:orderbook:symbol=BTCUSDT,limit=5",
+#             inputs: []
+#         },
+#         
+#         # Get current position
+#         {
+#             id: sha256("get_position"),
+#             type: External,
+#             uri: "binance:balance:BTC",
+#             inputs: []
+#         },
+#         
+#         # =========== PRICE CALCULATIONS ===========
+#         
+#         # Calculate bid price: mid_price * (1 - spread)
+#         {
+#             id: sha256("calc_bid_multiplier"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.9975], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("calc_bid_price"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["get_ticker", "calc_bid_multiplier"]
+#         },
+#         
+#         # Calculate ask price: mid_price * (1 + spread)
+#         {
+#             id: sha256("calc_ask_multiplier"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0025], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("calc_ask_price"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["get_ticker", "calc_ask_multiplier"]
+#         },
+#         
+#         # =========== POSITION CHECKS ===========
+#         
+#         # Check if position is within limits
+#         {
+#             id: sha256("position_check"),
+#             type: Operation,
+#             op: Lt,
+#             inputs: ["get_position", "config_max_position"]
+#         },
+#         
+#         # =========== CONFIDENCE CHECK ===========
+#         
+#         # Check if market data confidence is high enough
+#         # (Data from exchange has confidence, we check it)
+#         {
+#             id: sha256("confidence_check"),
+#             type: Operation,
+#             op: Gt,
+#             inputs: ["get_ticker", "config_confidence_threshold"]
+#             # Note: This compares the confidence field of get_ticker tensor
+#         },
+#         
+#         # =========== ORDER DECISIONS ===========
+#         
+#         # Decision: Should we place bid order?
+#         {
+#             id: sha256("should_place_bid"),
+#             type: Branch,
+#             condition: "confidence_check",
+#             threshold: 0.5,
+#             true_branch: "place_bid_order",
+#             false_branch: "no_op_bid"
+#         },
+#         
+#         # Decision: Should we place ask order?
+#         {
+#             id: sha256("should_place_ask"),
+#             type: Branch,
+#             condition: "confidence_check",
+#             threshold: 0.5,
+#             true_branch: "place_ask_order",
+#             false_branch: "no_op_ask"
+#         },
+#         
+#         # =========== ORDER EXECUTION ===========
+#         
+#         # Place bid order
+#         {
+#             id: sha256("place_bid_order"),
+#             type: External,
+#             uri: "binance:order:symbol=BTCUSDT,side=BUY",
+#             inputs: ["calc_bid_price", "config_order_size"]
+#         },
+#         
+#         # Place ask order
+#         {
+#             id: sha256("place_ask_order"),
+#             type: External,
+#             uri: "binance:order:symbol=BTCUSDT,side=SELL",
+#             inputs: ["calc_ask_price", "config_order_size"]
+#         },
+#         
+#         # No-op nodes for when conditions not met
+#         {
+#             id: sha256("no_op_bid"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("no_op_ask"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         
+#         # =========== OUTPUT AGGREGATION ===========
+#         
+#         # Combine order results
+#         {
+#             id: sha256("output"),
+#             type: Operation,
+#             op: Concat,
+#             inputs: ["should_place_bid", "should_place_ask"]
+#         }
+#     ],
+#     
+#     entry_point: "get_ticker",
+#     outputs: ["output"],
+#     
+#     proofs: [
+#         HaltingProof {
+#             max_steps: 50,
+#             fuel_budget: 500
+#         },
+#         StrategyProof {
+#             name: "market_making_v1",
+#             author: sha256("0-protocol"),
+#             timestamp: 1706745600,  # 2024-02-01
+#             parameters: {
+#                 spread: 0.005,
+#                 order_size: 0.01,
+#                 symbol: "BTCUSDT"
+#             }
+#         }
+#     ],
+#     
+#     metadata: {
+#         created_by: "0-hummingbot",
+#         created_at: 1706745600,
+#         description: "Market making strategy with configurable spread"
+#     }
+# }
+#
+# ============================================================================
+# EXECUTION FLOW
+# ============================================================================
+#
+#                    ┌─────────────────┐
+#                    │   get_ticker    │ ──────────────────────────┐
+#                    │   (External)    │                           │
+#                    └────────┬────────┘                           │
+#                             │                                    │
+#           ┌─────────────────┼─────────────────┐                  │
+#           │                 │                 │                  │
+#           ▼                 ▼                 ▼                  ▼
+#   ┌───────────────┐ ┌───────────────┐ ┌──────────────────────────────┐
+#   │ calc_bid_price│ │ calc_ask_price│ │     confidence_check         │
+#   │   (Op:Mul)    │ │   (Op:Mul)    │ │        (Op:Gt)               │
+#   └───────┬───────┘ └───────┬───────┘ └──────────────┬───────────────┘
+#           │                 │                        │
+#           │                 │         ┌──────────────┴──────────────┐
+#           │                 │         │                             │
+#           ▼                 ▼         ▼                             ▼
+#   ┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+#   │ place_bid_order│ │ place_ask_order│ │  no_op_bid    │ │  no_op_ask    │
+#   │   (External)   │ │   (External)   │ │  (Constant)   │ │  (Constant)   │
+#   └───────┬───────┘ └───────┬───────┘ └───────┬───────┘ └───────┬───────┘
+#           │                 │                 │                 │
+#           └────────┬────────┴────────┬────────┘                 │
+#                    │                 │                          │
+#                    ▼                 ▼                          │
+#            ┌───────────────────────────────────────────────────┘
+#            │                   output
+#            │                 (Op:Concat)
+#            └───────────────────────────────────────────────────────
+#
+# ============================================================================
+# WHY 0-LANG IS BETTER FOR THIS
+# ============================================================================
+#
+# 1. DETERMINISTIC: Same market data → Same orders. Always.
+#
+# 2. VERIFIABLE: The strategy hash proves what logic generated this order.
+#    An auditor can verify: sha256(this_graph) + sha256(market_data) = order
+#
+# 3. AGENT-NATIVE: An AI agent can read this graph directly and understand
+#    the trading logic without parsing Python syntax.
+#
+# 4. COMPOSABLE: This graph can be imported into a larger strategy graph,
+#    or have its parameters modified by another agent.
+#
+# 5. PROOF-CARRYING: The HaltingProof guarantees this strategy terminates.
+#    The StrategyProof documents the intent and parameters.
+#
+# ============================================================================
+
+# Binary content placeholder - generate with:
+#   zero generate graphs/strategies/market_making.0
