@@ -356,14 +356,18 @@ This project follows the "Evolve Together" pattern:
 | HTTP External Resolver | ✅ Done | REST API calls via External nodes |
 | Binance Resolver | ✅ Done | Specialized resolver for Binance API |
 | URI Protocol | ✅ Done | `http:get:service:/path` format |
+| Comparison Ops (Gte, Lte) | ✅ Done | Greater/less than or equal |
+| Math Ops (Min, Max) | ✅ Done | Element-wise and reduction |
+| Math Ops (Abs, Neg) | ✅ Done | Absolute value and negation |
+| Clamp Operation | ✅ Done | Clamp values to range (position limits) |
 | WebSocket Resolver | 🔄 Planned | Real-time data streams |
 | JSON Operations | 🔄 Planned | `Op::JsonParse`, `Op::JsonGet` |
 | Decimal Tensors | 🔄 Planned | Financial-grade precision |
 | Timer/Scheduler | 🔄 Planned | Periodic graph execution |
 
-### 0-lang Enhancements Identified
+### 0-lang Enhancements Identified (Backlog)
 
-Through building 0-hummingbot, we've identified these improvements needed in 0-lang:
+Through building 0-hummingbot, we've identified these improvements for future 0-lang versions:
 
 1. **String Tensor Type** - Currently only f32, need string support for API responses
 2. **Async External Nodes** - Parallel execution of multiple API calls
