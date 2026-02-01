@@ -1,0 +1,434 @@
+# Position Manager Component
+#
+# Tracks and manages trading positions, calculating P&L and maintaining
+# position state across fills.
+#
+# ============================================================================
+# COMPONENT OVERVIEW
+# ============================================================================
+#
+# The position manager maintains accurate position tracking:
+#   - Updates position on each fill
+#   - Calculates realized and unrealized P&L
+#   - Tracks entry prices (FIFO/LIFO/average)
+#   - Provides position analytics
+#
+# ============================================================================
+# INTERFACE
+# ============================================================================
+#
+# Inputs:
+#   - fill_side: Tensor<1> - 1.0=BUY, 0.0=SELL
+#   - fill_quantity: Tensor<1> - Quantity filled
+#   - fill_price: Tensor<1> - Price of fill
+#   - current_market_price: Tensor<1> - Current market price (for unrealized P&L)
+#   - current_position: Tensor<1> - Current position (from state)
+#   - average_entry_price: Tensor<1> - Average entry price (from state)
+#   - realized_pnl: Tensor<1> - Cumulative realized P&L (from state)
+#
+# Outputs:
+#   - new_position: Tensor<1> - Updated position after fill
+#   - new_average_entry: Tensor<1> - Updated average entry price
+#   - fill_pnl: Tensor<1> - P&L from this specific fill
+#   - total_realized_pnl: Tensor<1> - Total realized P&L
+#   - unrealized_pnl: Tensor<1> - Current unrealized P&L
+#   - position_value: Tensor<1> - Current position notional value
+#
+# ============================================================================
+# GRAPH DEFINITION
+# ============================================================================
+#
+# Graph {
+#     name: "position_manager",
+#     version: 1,
+#     description: "Position tracking and P&L calculation component",
+#     component_type: "state_manager",
+#     
+#     nodes: [
+#         # =========== CONSTANTS ===========
+#         
+#         {
+#             id: sha256("const_zero"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("const_one"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("const_neg_one"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [-1.0], confidence: 1.0 }
+#         },
+#         
+#         # =========== INPUTS ===========
+#         
+#         {
+#             id: sha256("input_fill_side"),
+#             type: SubgraphInput,
+#             name: "fill_side"
+#         },
+#         {
+#             id: sha256("input_fill_quantity"),
+#             type: SubgraphInput,
+#             name: "fill_quantity"
+#         },
+#         {
+#             id: sha256("input_fill_price"),
+#             type: SubgraphInput,
+#             name: "fill_price"
+#         },
+#         {
+#             id: sha256("input_current_market_price"),
+#             type: SubgraphInput,
+#             name: "current_market_price"
+#         },
+#         {
+#             id: sha256("input_current_position"),
+#             type: SubgraphInput,
+#             name: "current_position"
+#         },
+#         {
+#             id: sha256("input_average_entry_price"),
+#             type: SubgraphInput,
+#             name: "average_entry_price"
+#         },
+#         {
+#             id: sha256("input_realized_pnl"),
+#             type: SubgraphInput,
+#             name: "realized_pnl"
+#         },
+#         
+#         # =========== POSITION UPDATE ===========
+#         
+#         # Calculate signed quantity change
+#         # BUY: +quantity, SELL: -quantity
+#         {
+#             id: sha256("position_change_buy"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["input_fill_quantity", "const_one"]
+#         },
+#         {
+#             id: sha256("position_change_sell"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["input_fill_quantity", "const_neg_one"]
+#         },
+#         {
+#             id: sha256("signed_quantity_change"),
+#             type: Branch,
+#             condition: "input_fill_side",
+#             threshold: 0.5,
+#             true_branch: "position_change_buy",
+#             false_branch: "position_change_sell"
+#         },
+#         
+#         # New position = current + change
+#         {
+#             id: sha256("new_position"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["input_current_position", "signed_quantity_change"]
+#         },
+#         
+#         # =========== P&L CALCULATION ===========
+#         
+#         # Determine if this fill is opening or closing
+#         # Opening: position and change have same sign (or position was zero)
+#         # Closing: position and change have opposite signs
+#         
+#         # Sign of current position
+#         {
+#             id: sha256("position_sign_raw"),
+#             type: Operation,
+#             op: Gt,
+#             inputs: ["input_current_position", "const_zero"]
+#         },
+#         
+#         # Sign of change (1 for buy, 0 for sell)
+#         # fill_side already represents this
+#         
+#         # Is closing trade? (position_sign != fill_side)
+#         # Long position (>0) + SELL (0) = closing
+#         # Short position (<0) + BUY (1) = closing
+#         {
+#             id: sha256("position_is_long"),
+#             type: Operation,
+#             op: Gt,
+#             inputs: ["input_current_position", "const_zero"]
+#         },
+#         {
+#             id: sha256("is_closing_long"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["position_is_long", "input_fill_side"]
+#             # 1 * 0 = 0 if closing long (sell), otherwise varies
+#         },
+#         
+#         # Calculate quantity that is closing existing position
+#         {
+#             id: sha256("abs_current_position"),
+#             type: Operation,
+#             op: Abs,
+#             inputs: ["input_current_position"]
+#         },
+#         {
+#             id: sha256("closing_quantity"),
+#             type: Operation,
+#             op: Min,
+#             inputs: ["input_fill_quantity", "abs_current_position"]
+#         },
+#         
+#         # Realized P&L from closing
+#         # If long position being closed (sold):
+#         #   pnl = closing_qty * (fill_price - entry_price)
+#         # If short position being closed (bought):
+#         #   pnl = closing_qty * (entry_price - fill_price)
+#         
+#         {
+#             id: sha256("price_diff_long"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["input_fill_price", "input_average_entry_price"]
+#         },
+#         {
+#             id: sha256("price_diff_short"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["input_average_entry_price", "input_fill_price"]
+#         },
+#         
+#         {
+#             id: sha256("price_diff"),
+#             type: Branch,
+#             condition: "position_is_long",
+#             threshold: 0.5,
+#             true_branch: "price_diff_long",
+#             false_branch: "price_diff_short"
+#         },
+#         
+#         {
+#             id: sha256("fill_pnl"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["closing_quantity", "price_diff"]
+#         },
+#         
+#         # Total realized P&L
+#         {
+#             id: sha256("total_realized_pnl"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["input_realized_pnl", "fill_pnl"]
+#         },
+#         
+#         # =========== AVERAGE ENTRY PRICE UPDATE ===========
+#         
+#         # For opening trades, update average entry using FIFO
+#         # new_avg = (old_position * old_avg + opening_qty * fill_price) / new_position
+#         
+#         # Opening quantity = fill_quantity - closing_quantity
+#         {
+#             id: sha256("opening_quantity"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["input_fill_quantity", "closing_quantity"]
+#         },
+#         
+#         # Value of old position
+#         {
+#             id: sha256("old_position_value"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["input_current_position", "input_average_entry_price"]
+#         },
+#         {
+#             id: sha256("abs_old_position_value"),
+#             type: Operation,
+#             op: Abs,
+#             inputs: ["old_position_value"]
+#         },
+#         
+#         # Value of new opening
+#         {
+#             id: sha256("opening_value"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["opening_quantity", "input_fill_price"]
+#         },
+#         
+#         # Total value
+#         {
+#             id: sha256("total_value"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["abs_old_position_value", "opening_value"]
+#         },
+#         
+#         # New position absolute
+#         {
+#             id: sha256("abs_new_position"),
+#             type: Operation,
+#             op: Abs,
+#             inputs: ["new_position"]
+#         },
+#         
+#         # Prevent division by zero
+#         {
+#             id: sha256("small_epsilon"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0001], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("safe_divisor"),
+#             type: Operation,
+#             op: Max,
+#             inputs: ["abs_new_position", "small_epsilon"]
+#         },
+#         
+#         # New average entry
+#         {
+#             id: sha256("calculated_new_avg"),
+#             type: Operation,
+#             op: Div,
+#             inputs: ["total_value", "safe_divisor"]
+#         },
+#         
+#         # If position is zero, use fill price as entry
+#         {
+#             id: sha256("position_is_zero"),
+#             type: Operation,
+#             op: Lt,
+#             inputs: ["abs_new_position", "small_epsilon"]
+#         },
+#         {
+#             id: sha256("new_average_entry"),
+#             type: Branch,
+#             condition: "position_is_zero",
+#             threshold: 0.5,
+#             true_branch: "input_fill_price",
+#             false_branch: "calculated_new_avg"
+#         },
+#         
+#         # =========== UNREALIZED P&L ===========
+#         
+#         # Unrealized P&L = position * (market_price - entry_price)
+#         # Sign adjusted based on position direction
+#         
+#         {
+#             id: sha256("market_vs_entry"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["input_current_market_price", "new_average_entry"]
+#         },
+#         {
+#             id: sha256("unrealized_pnl"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["new_position", "market_vs_entry"]
+#         },
+#         
+#         # =========== POSITION VALUE ===========
+#         
+#         {
+#             id: sha256("position_value"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["abs_new_position", "input_current_market_price"]
+#         },
+#         
+#         # =========== OUTPUTS ===========
+#         
+#         {
+#             id: sha256("output_new_position"),
+#             type: SubgraphOutput,
+#             name: "new_position",
+#             input: "new_position"
+#         },
+#         {
+#             id: sha256("output_new_average_entry"),
+#             type: SubgraphOutput,
+#             name: "new_average_entry",
+#             input: "new_average_entry"
+#         },
+#         {
+#             id: sha256("output_fill_pnl"),
+#             type: SubgraphOutput,
+#             name: "fill_pnl",
+#             input: "fill_pnl"
+#         },
+#         {
+#             id: sha256("output_total_realized_pnl"),
+#             type: SubgraphOutput,
+#             name: "total_realized_pnl",
+#             input: "total_realized_pnl"
+#         },
+#         {
+#             id: sha256("output_unrealized_pnl"),
+#             type: SubgraphOutput,
+#             name: "unrealized_pnl",
+#             input: "unrealized_pnl"
+#         },
+#         {
+#             id: sha256("output_position_value"),
+#             type: SubgraphOutput,
+#             name: "position_value",
+#             input: "position_value"
+#         }
+#     ],
+#     
+#     entry_point: "input_fill_side",
+#     outputs: [
+#         "output_new_position",
+#         "output_new_average_entry", 
+#         "output_fill_pnl",
+#         "output_total_realized_pnl",
+#         "output_unrealized_pnl",
+#         "output_position_value"
+#     ],
+#     
+#     proofs: [
+#         HaltingProof {
+#             max_steps: 50,
+#             fuel_budget: 500
+#         }
+#     ],
+#     
+#     metadata: {
+#         created_by: "0-hummingbot/agent4",
+#         component_type: "state_manager",
+#         reusable: true,
+#         description: "Position tracking and P&L calculation"
+#     }
+# }
+#
+# ============================================================================
+# P&L CALCULATION EXAMPLE
+# ============================================================================
+#
+# Starting state:
+#   position = 0.5 BTC (long)
+#   entry_price = $50,000
+#   realized_pnl = $100
+#
+# Fill event:
+#   side = SELL
+#   quantity = 0.3 BTC
+#   price = $51,000
+#
+# Calculation:
+#   closing_quantity = min(0.3, |0.5|) = 0.3
+#   price_diff = 51,000 - 50,000 = $1,000
+#   fill_pnl = 0.3 * $1,000 = $300
+#
+# New state:
+#   new_position = 0.5 - 0.3 = 0.2 BTC
+#   new_entry = $50,000 (unchanged, was closing)
+#   realized_pnl = $100 + $300 = $400
+#
+# ============================================================================
+
+# Binary content placeholder

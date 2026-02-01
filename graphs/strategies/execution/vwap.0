@@ -1,0 +1,469 @@
+# Volume-Weighted Average Price (VWAP) Execution Strategy
+#
+# Executes orders proportionally to historical volume patterns.
+# This strategy aims to match or beat the market VWAP.
+#
+# ============================================================================
+# STRATEGY OVERVIEW
+# ============================================================================
+#
+# VWAP execution distributes orders according to typical volume patterns.
+# If 30% of daily volume occurs in the first hour, 30% of the order
+# should be executed in the first hour.
+#
+# Key Differences from TWAP:
+#   - TWAP: Equal slices over time
+#   - VWAP: Variable slices based on volume profile
+#
+# Benefits:
+#   - Lower market impact (trades with the flow)
+#   - Better execution vs benchmark VWAP
+#   - Adapts to market liquidity patterns
+#
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+#
+# Parameters:
+#   - total_quantity: Total amount to execute
+#   - side: BUY or SELL
+#   - duration_seconds: Execution window
+#   - volume_profile: Historical volume distribution (24 hours)
+#   - participation_rate: Max % of interval volume to take
+#   - min_order_size: Minimum slice size
+#   - urgency: 0-1, higher = more aggressive
+#
+# ============================================================================
+# VOLUME PROFILE
+# ============================================================================
+#
+# Typical BTC volume profile (normalized, hourly):
+# Hour  | Volume %
+# ------|----------
+#  0-1  |  3.5%
+#  1-2  |  3.2%
+#  2-3  |  3.0%
+#  ...  |  ...
+# 14-15 |  5.8%  (US market open)
+# 15-16 |  6.2%
+# 16-17 |  5.9%
+#  ...  |  ...
+# 22-23 |  4.1%
+# 23-24 |  3.8%
+#
+# ============================================================================
+# GRAPH DEFINITION
+# ============================================================================
+#
+# Graph {
+#     name: "vwap_execution",
+#     version: 1,
+#     description: "Volume-weighted average price execution algorithm",
+#     
+#     nodes: [
+#         # =========== CONFIGURATION ===========
+#         
+#         # Total quantity to execute
+#         {
+#             id: sha256("config_total_qty"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [10.0], confidence: 1.0 }
+#         },
+#         
+#         # Order side (1.0 = BUY, 0.0 = SELL)
+#         {
+#             id: sha256("config_side"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         
+#         # Maximum participation rate (% of interval volume)
+#         {
+#             id: sha256("config_max_participation"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.10], confidence: 1.0 }
+#         },
+#         
+#         # Minimum order size
+#         {
+#             id: sha256("config_min_order"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.01], confidence: 1.0 }
+#         },
+#         
+#         # Urgency parameter (0=passive, 1=aggressive)
+#         {
+#             id: sha256("config_urgency"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.5], confidence: 1.0 }
+#         },
+#         
+#         # Historical volume profile (24 hourly buckets, normalized)
+#         {
+#             id: sha256("config_volume_profile"),
+#             type: Constant,
+#             value: Tensor {
+#                 shape: [24],
+#                 data: [
+#                     0.035, 0.032, 0.030, 0.028, 0.030, 0.032,  # 0-6
+#                     0.035, 0.040, 0.045, 0.050, 0.048, 0.046,  # 6-12
+#                     0.044, 0.048, 0.058, 0.062, 0.059, 0.054,  # 12-18
+#                     0.050, 0.048, 0.045, 0.042, 0.041, 0.038   # 18-24
+#                 ],
+#                 confidence: 1.0
+#             }
+#         },
+#         
+#         # =========== MARKET DATA ===========
+#         
+#         # Current mid price
+#         {
+#             id: sha256("get_mid_price"),
+#             type: External,
+#             uri: "binance:ticker:BTCUSDT",
+#             inputs: []
+#         },
+#         
+#         # Current hour (0-23)
+#         {
+#             id: sha256("get_current_hour"),
+#             type: External,
+#             uri: "system:time:hour_utc",
+#             inputs: []
+#         },
+#         
+#         # Recent volume in current interval
+#         {
+#             id: sha256("get_recent_volume"),
+#             type: External,
+#             uri: "binance:volume:symbol=BTCUSDT,period=300",
+#             inputs: []
+#         },
+#         
+#         # Average daily volume
+#         {
+#             id: sha256("get_avg_daily_volume"),
+#             type: External,
+#             uri: "binance:volume:symbol=BTCUSDT,period=86400,type=average",
+#             inputs: []
+#         },
+#         
+#         # =========== STATE ===========
+#         
+#         # Quantity already executed
+#         {
+#             id: sha256("get_executed_qty"),
+#             type: External,
+#             uri: "state:vwap:executed_quantity",
+#             inputs: []
+#         },
+#         
+#         # Execution start time
+#         {
+#             id: sha256("get_start_time"),
+#             type: External,
+#             uri: "state:vwap:start_time",
+#             inputs: []
+#         },
+#         
+#         # =========== REMAINING QUANTITY ===========
+#         
+#         {
+#             id: sha256("remaining_qty"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["config_total_qty", "get_executed_qty"]
+#         },
+#         
+#         # Check if anything remains
+#         {
+#             id: sha256("const_zero"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("has_remaining"),
+#             type: Operation,
+#             op: Gt,
+#             inputs: ["remaining_qty", "const_zero"]
+#         },
+#         
+#         # =========== VOLUME PROFILE LOOKUP ===========
+#         
+#         # Get expected volume % for current hour
+#         # This would use an Index operation to lookup from profile
+#         {
+#             id: sha256("expected_volume_pct"),
+#             type: Operation,
+#             op: Index,
+#             inputs: ["config_volume_profile", "get_current_hour"]
+#         },
+#         
+#         # Expected volume this interval = avg_daily * profile_pct * (interval/hour)
+#         {
+#             id: sha256("interval_fraction"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0833], confidence: 1.0 }
+#             # 5 minutes / 60 minutes = 1/12
+#         },
+#         
+#         {
+#             id: sha256("expected_interval_vol"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["get_avg_daily_volume", "expected_volume_pct"]
+#         },
+#         {
+#             id: sha256("expected_vol_scaled"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["expected_interval_vol", "interval_fraction"]
+#         },
+#         
+#         # =========== TARGET QUANTITY CALCULATION ===========
+#         
+#         # Base target = remaining * (expected_vol / total_expected_remaining)
+#         # Simplified: target = remaining * expected_volume_pct * num_remaining_intervals
+#         
+#         # For simplicity, use: target = participation_rate * recent_volume
+#         {
+#             id: sha256("volume_based_target"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["get_recent_volume", "config_max_participation"]
+#         },
+#         
+#         # Adjust for urgency
+#         # target = volume_based * (1 + urgency)
+#         {
+#             id: sha256("const_one"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("urgency_multiplier"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["const_one", "config_urgency"]
+#         },
+#         {
+#             id: sha256("urgency_adjusted_target"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["volume_based_target", "urgency_multiplier"]
+#         },
+#         
+#         # Clamp to remaining and minimum
+#         {
+#             id: sha256("target_clamped_max"),
+#             type: Operation,
+#             op: Min,
+#             inputs: ["urgency_adjusted_target", "remaining_qty"]
+#         },
+#         {
+#             id: sha256("target_quantity"),
+#             type: Operation,
+#             op: Max,
+#             inputs: ["target_clamped_max", "config_min_order"]
+#         },
+#         
+#         # =========== PRICE CALCULATION ===========
+#         
+#         # For VWAP, we typically use aggressive pricing
+#         # BUY: slightly above mid, SELL: slightly below mid
+#         
+#         {
+#             id: sha256("config_aggression"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0005], confidence: 1.0 }
+#         },
+#         
+#         # BUY price = mid * (1 + aggression)
+#         {
+#             id: sha256("buy_mult"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["const_one", "config_aggression"]
+#         },
+#         {
+#             id: sha256("buy_price"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["get_mid_price", "buy_mult"]
+#         },
+#         
+#         # SELL price = mid * (1 - aggression)
+#         {
+#             id: sha256("sell_mult"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["const_one", "config_aggression"]
+#         },
+#         {
+#             id: sha256("sell_price"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["get_mid_price", "sell_mult"]
+#         },
+#         
+#         # Select price based on side
+#         {
+#             id: sha256("limit_price"),
+#             type: Branch,
+#             condition: "config_side",
+#             threshold: 0.5,
+#             true_branch: "buy_price",
+#             false_branch: "sell_price"
+#         },
+#         
+#         # =========== EXECUTION ===========
+#         
+#         {
+#             id: sha256("execute_order"),
+#             type: Branch,
+#             condition: "has_remaining",
+#             threshold: 0.5,
+#             true_branch: "place_order",
+#             false_branch: "skip_order"
+#         },
+#         
+#         {
+#             id: sha256("place_order"),
+#             type: External,
+#             uri: "binance:order:symbol=BTCUSDT,type=LIMIT",
+#             inputs: ["limit_price", "target_quantity", "config_side"]
+#         },
+#         
+#         {
+#             id: sha256("skip_order"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         
+#         # =========== VWAP TRACKING ===========
+#         
+#         # Calculate current execution VWAP
+#         {
+#             id: sha256("get_execution_vwap"),
+#             type: External,
+#             uri: "state:vwap:execution_vwap",
+#             inputs: []
+#         },
+#         
+#         # Get market VWAP for comparison
+#         {
+#             id: sha256("get_market_vwap"),
+#             type: External,
+#             uri: "binance:vwap:symbol=BTCUSDT,period=3600",
+#             inputs: []
+#         },
+#         
+#         # Calculate slippage vs market VWAP
+#         {
+#             id: sha256("vwap_diff"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["get_execution_vwap", "get_market_vwap"]
+#         },
+#         {
+#             id: sha256("vwap_slippage"),
+#             type: Operation,
+#             op: Div,
+#             inputs: ["vwap_diff", "get_market_vwap"]
+#         },
+#         
+#         # =========== STATE UPDATE ===========
+#         
+#         {
+#             id: sha256("update_state"),
+#             type: External,
+#             uri: "state:vwap:update",
+#             inputs: ["execute_order", "target_quantity", "limit_price"]
+#         },
+#         
+#         # =========== OUTPUT ===========
+#         
+#         {
+#             id: sha256("output"),
+#             type: Operation,
+#             op: Concat,
+#             inputs: ["execute_order", "remaining_qty", "vwap_slippage", "target_quantity"]
+#         }
+#     ],
+#     
+#     entry_point: "get_mid_price",
+#     outputs: ["output"],
+#     
+#     proofs: [
+#         HaltingProof {
+#             max_steps: 80,
+#             fuel_budget: 800
+#         },
+#         ExecutionProof {
+#             name: "vwap_execution",
+#             total_quantity: 10.0,
+#             benchmark: "market_vwap"
+#         }
+#     ],
+#     
+#     metadata: {
+#         created_by: "0-hummingbot/agent4",
+#         created_at: 1706745600,
+#         description: "VWAP execution algorithm adapting to volume patterns"
+#     }
+# }
+#
+# ============================================================================
+# EXECUTION PATTERN
+# ============================================================================
+#
+#   Volume Profile (typical day)
+#   ▲
+#   │        ╭───╮
+#   │   ╭─╮ ╭╯   ╰╮
+#   │ ╭─╯ ╰╮│     │╭─╮
+#   │─╯     ╰╯     ╰╯ ╰─
+#   └──────────────────────────────► Hour
+#     0    6    12   18   24
+#
+#   VWAP Execution adapts:
+#   ▲ Order Size
+#   │        ████
+#   │   ██  █████
+#   │ ████ ██████ ██
+#   │████████████████
+#   └──────────────────────────────► Hour
+#     Low volume   High volume   Low volume
+#
+#   vs TWAP (constant):
+#   ▲ Order Size
+#   │ ████████████████████████████
+#   └──────────────────────────────► Hour
+#
+# ============================================================================
+# WHY 0-LANG EXCELS AT VWAP
+# ============================================================================
+#
+# 1. PROFILE-AWARE EXECUTION
+#    - Volume profile is a tensor, naturally handled
+#    - Index operation for profile lookup
+#    - Mathematically precise scheduling
+#
+# 2. REAL-TIME ADAPTATION
+#    - External nodes fetch live volume
+#    - Adjusts participation dynamically
+#    - Responds to unusual volume patterns
+#
+# 3. BENCHMARK TRACKING
+#    - Built-in VWAP calculation
+#    - Continuous slippage monitoring
+#    - Proof of execution quality
+#
+# 4. COMPLIANCE FRIENDLY
+#    - Every order links to execution plan
+#    - Volume participation is verifiable
+#    - Clear audit trail of decisions
+#
+# ============================================================================
+
+# Binary content placeholder

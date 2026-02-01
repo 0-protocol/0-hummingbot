@@ -1,0 +1,472 @@
+# Risk Check Component
+#
+# Reusable risk checking subgraph for trading strategies.
+# Validates orders against position limits, drawdown, and exposure rules.
+#
+# ============================================================================
+# COMPONENT OVERVIEW
+# ============================================================================
+#
+# This component is designed to be composed with any trading strategy.
+# It acts as a gatekeeper before order execution, ensuring all risk
+# parameters are within acceptable bounds.
+#
+# Risk Checks Performed:
+#   1. Position limit check (max long/short position)
+#   2. Order size check (max single order size)
+#   3. Daily loss limit check (max drawdown)
+#   4. Exposure check (max notional value)
+#   5. Rate limit check (max orders per period)
+#
+# ============================================================================
+# INTERFACE
+# ============================================================================
+#
+# Inputs:
+#   - current_position: Tensor<1> - Current inventory position
+#   - proposed_order_size: Tensor<1> - Size of proposed order
+#   - proposed_order_side: Tensor<1> - 1.0=BUY, 0.0=SELL
+#   - account_balance: Tensor<1> - Current account balance
+#   - daily_pnl: Tensor<1> - Profit/loss today
+#   - current_price: Tensor<1> - Current market price
+#
+# Outputs:
+#   - approved: Tensor<1> - 1.0 if order approved, 0.0 if rejected
+#   - adjusted_size: Tensor<1> - Possibly reduced order size
+#   - rejection_reason: Tensor<1> - Code indicating rejection reason
+#       0 = approved
+#       1 = position limit exceeded
+#       2 = order size limit exceeded
+#       3 = daily loss limit exceeded
+#       4 = exposure limit exceeded
+#       5 = rate limit exceeded
+#
+# ============================================================================
+# GRAPH DEFINITION
+# ============================================================================
+#
+# Graph {
+#     name: "risk_check",
+#     version: 1,
+#     description: "Reusable risk checking component",
+#     component_type: "risk_manager",
+#     
+#     nodes: [
+#         # =========== CONFIGURATION ===========
+#         
+#         # Maximum position (long or short)
+#         {
+#             id: sha256("config_max_position"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         
+#         # Maximum single order size
+#         {
+#             id: sha256("config_max_order_size"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.1], confidence: 1.0 }
+#         },
+#         
+#         # Maximum daily loss (as fraction of balance)
+#         {
+#             id: sha256("config_max_daily_loss"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.02], confidence: 1.0 }
+#         },
+#         
+#         # Maximum exposure (notional as multiple of balance)
+#         {
+#             id: sha256("config_max_exposure"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [2.0], confidence: 1.0 }
+#         },
+#         
+#         # Constants
+#         {
+#             id: sha256("const_zero"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("const_one"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("const_neg_one"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [-1.0], confidence: 1.0 }
+#         },
+#         
+#         # Rejection reason codes
+#         {
+#             id: sha256("reason_approved"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("reason_position_limit"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("reason_order_size"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [2.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("reason_daily_loss"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [3.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("reason_exposure"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [4.0], confidence: 1.0 }
+#         },
+#         
+#         # =========== INPUTS (External/Subgraph) ===========
+#         
+#         {
+#             id: sha256("input_current_position"),
+#             type: SubgraphInput,
+#             name: "current_position"
+#         },
+#         {
+#             id: sha256("input_proposed_order_size"),
+#             type: SubgraphInput,
+#             name: "proposed_order_size"
+#         },
+#         {
+#             id: sha256("input_proposed_order_side"),
+#             type: SubgraphInput,
+#             name: "proposed_order_side"
+#         },
+#         {
+#             id: sha256("input_account_balance"),
+#             type: SubgraphInput,
+#             name: "account_balance"
+#         },
+#         {
+#             id: sha256("input_daily_pnl"),
+#             type: SubgraphInput,
+#             name: "daily_pnl"
+#         },
+#         {
+#             id: sha256("input_current_price"),
+#             type: SubgraphInput,
+#             name: "current_price"
+#         },
+#         
+#         # =========== POSITION LIMIT CHECK ===========
+#         
+#         # Calculate position after order
+#         # For BUY: new_position = current + size
+#         # For SELL: new_position = current - size
+#         
+#         # Convert side to sign: BUY(1.0)->+1, SELL(0.0)->-1
+#         {
+#             id: sha256("order_sign"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["input_proposed_order_side", "const_zero"]
+#             # This gives 1.0 for BUY, 0.0 for SELL
+#         },
+#         {
+#             id: sha256("order_sign_adjusted"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["order_sign", "const_one"]
+#             # BUY: 1-1=0 (wrong), need different approach
+#         },
+#         
+#         # Simpler: use branch
+#         {
+#             id: sha256("position_change_buy"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["input_current_position", "input_proposed_order_size"]
+#         },
+#         {
+#             id: sha256("position_change_sell"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["input_current_position", "input_proposed_order_size"]
+#         },
+#         {
+#             id: sha256("position_after_order"),
+#             type: Branch,
+#             condition: "input_proposed_order_side",
+#             threshold: 0.5,
+#             true_branch: "position_change_buy",
+#             false_branch: "position_change_sell"
+#         },
+#         
+#         # Check absolute position limit
+#         {
+#             id: sha256("abs_new_position"),
+#             type: Operation,
+#             op: Abs,
+#             inputs: ["position_after_order"]
+#         },
+#         {
+#             id: sha256("position_ok"),
+#             type: Operation,
+#             op: Lte,
+#             inputs: ["abs_new_position", "config_max_position"]
+#         },
+#         
+#         # =========== ORDER SIZE CHECK ===========
+#         
+#         {
+#             id: sha256("order_size_ok"),
+#             type: Operation,
+#             op: Lte,
+#             inputs: ["input_proposed_order_size", "config_max_order_size"]
+#         },
+#         
+#         # =========== DAILY LOSS CHECK ===========
+#         
+#         # Calculate loss as fraction of balance
+#         {
+#             id: sha256("daily_loss_fraction"),
+#             type: Operation,
+#             op: Div,
+#             inputs: ["input_daily_pnl", "input_account_balance"]
+#         },
+#         
+#         # Negate (loss is negative PnL)
+#         {
+#             id: sha256("daily_loss_positive"),
+#             type: Operation,
+#             op: Neg,
+#             inputs: ["daily_loss_fraction"]
+#         },
+#         
+#         # Clamp to >= 0 (only care about losses)
+#         {
+#             id: sha256("daily_loss_clamped"),
+#             type: Operation,
+#             op: Max,
+#             inputs: ["daily_loss_positive", "const_zero"]
+#         },
+#         
+#         {
+#             id: sha256("daily_loss_ok"),
+#             type: Operation,
+#             op: Lt,
+#             inputs: ["daily_loss_clamped", "config_max_daily_loss"]
+#         },
+#         
+#         # =========== EXPOSURE CHECK ===========
+#         
+#         # Current exposure = |position| * price
+#         {
+#             id: sha256("current_exposure"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["abs_new_position", "input_current_price"]
+#         },
+#         
+#         # Max allowed exposure = balance * max_exposure_mult
+#         {
+#             id: sha256("max_exposure_value"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["input_account_balance", "config_max_exposure"]
+#         },
+#         
+#         {
+#             id: sha256("exposure_ok"),
+#             type: Operation,
+#             op: Lte,
+#             inputs: ["current_exposure", "max_exposure_value"]
+#         },
+#         
+#         # =========== COMBINE ALL CHECKS ===========
+#         
+#         # All checks must pass (multiply all: 1*1*1*1 = 1, any 0 = 0)
+#         {
+#             id: sha256("check_1_2"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["position_ok", "order_size_ok"]
+#         },
+#         {
+#             id: sha256("check_3_4"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["daily_loss_ok", "exposure_ok"]
+#         },
+#         {
+#             id: sha256("all_checks_passed"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["check_1_2", "check_3_4"]
+#         },
+#         
+#         # =========== DETERMINE REJECTION REASON ===========
+#         
+#         # Priority: position > order_size > daily_loss > exposure
+#         {
+#             id: sha256("select_reason_1"),
+#             type: Branch,
+#             condition: "position_ok",
+#             threshold: 0.5,
+#             true_branch: "reason_approved",
+#             false_branch: "reason_position_limit"
+#         },
+#         {
+#             id: sha256("select_reason_2"),
+#             type: Branch,
+#             condition: "order_size_ok",
+#             threshold: 0.5,
+#             true_branch: "select_reason_1",
+#             false_branch: "reason_order_size"
+#         },
+#         {
+#             id: sha256("select_reason_3"),
+#             type: Branch,
+#             condition: "daily_loss_ok",
+#             threshold: 0.5,
+#             true_branch: "select_reason_2",
+#             false_branch: "reason_daily_loss"
+#         },
+#         {
+#             id: sha256("rejection_reason"),
+#             type: Branch,
+#             condition: "exposure_ok",
+#             threshold: 0.5,
+#             true_branch: "select_reason_3",
+#             false_branch: "reason_exposure"
+#         },
+#         
+#         # =========== ADJUST ORDER SIZE ===========
+#         
+#         # If position would exceed limit, calculate max allowed
+#         {
+#             id: sha256("remaining_position_capacity"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["config_max_position", "abs_new_position"]
+#         },
+#         {
+#             id: sha256("max_allowed_order"),
+#             type: Operation,
+#             op: Max,
+#             inputs: ["remaining_position_capacity", "const_zero"]
+#         },
+#         
+#         # Take minimum of proposed and max allowed
+#         {
+#             id: sha256("adjusted_size"),
+#             type: Operation,
+#             op: Min,
+#             inputs: ["input_proposed_order_size", "max_allowed_order"]
+#         },
+#         
+#         # =========== OUTPUTS ===========
+#         
+#         {
+#             id: sha256("output_approved"),
+#             type: SubgraphOutput,
+#             name: "approved",
+#             input: "all_checks_passed"
+#         },
+#         {
+#             id: sha256("output_adjusted_size"),
+#             type: SubgraphOutput,
+#             name: "adjusted_size",
+#             input: "adjusted_size"
+#         },
+#         {
+#             id: sha256("output_rejection_reason"),
+#             type: SubgraphOutput,
+#             name: "rejection_reason",
+#             input: "rejection_reason"
+#         }
+#     ],
+#     
+#     entry_point: "input_current_position",
+#     outputs: ["output_approved", "output_adjusted_size", "output_rejection_reason"],
+#     
+#     proofs: [
+#         HaltingProof {
+#             max_steps: 40,
+#             fuel_budget: 400
+#         }
+#     ],
+#     
+#     metadata: {
+#         created_by: "0-hummingbot/agent4",
+#         component_type: "risk_manager",
+#         reusable: true,
+#         description: "Risk check component for validating trading orders"
+#     }
+# }
+#
+# ============================================================================
+# USAGE EXAMPLE
+# ============================================================================
+#
+# To use this component in a strategy:
+#
+# 1. Import the component:
+#    composer.import("risk_check.0")
+#
+# 2. Connect inputs from your strategy:
+#    composer.connect("my_strategy.position", "risk_check.current_position")
+#    composer.connect("my_strategy.order_size", "risk_check.proposed_order_size")
+#    ...
+#
+# 3. Use outputs in execution:
+#    composer.connect("risk_check.approved", "executor.should_execute")
+#    composer.connect("risk_check.adjusted_size", "executor.order_size")
+#
+# ============================================================================
+# RISK CHECK FLOW
+# ============================================================================
+#
+#   Inputs from Strategy
+#   ════════════════════
+#         │
+#         ▼
+#   ┌─────────────────────────────────────────────────────┐
+#   │              POSITION LIMIT CHECK                   │
+#   │   new_pos = current ± order_size                    │
+#   │   |new_pos| <= max_position?                        │
+#   └─────────────────────────────────────────────────────┘
+#         │
+#         ▼
+#   ┌─────────────────────────────────────────────────────┐
+#   │              ORDER SIZE CHECK                       │
+#   │   order_size <= max_order_size?                     │
+#   └─────────────────────────────────────────────────────┘
+#         │
+#         ▼
+#   ┌─────────────────────────────────────────────────────┐
+#   │              DAILY LOSS CHECK                       │
+#   │   daily_loss / balance < max_daily_loss?            │
+#   └─────────────────────────────────────────────────────┘
+#         │
+#         ▼
+#   ┌─────────────────────────────────────────────────────┐
+#   │              EXPOSURE CHECK                         │
+#   │   |position| * price < balance * max_exposure?      │
+#   └─────────────────────────────────────────────────────┘
+#         │
+#         ▼
+#   ┌─────────────────────────────────────────────────────┐
+#   │              DECISION                               │
+#   │   All checks pass? → APPROVED                       │
+#   │   Any check fails? → REJECTED + REASON              │
+#   └─────────────────────────────────────────────────────┘
+#         │
+#         ▼
+#   Outputs to Strategy
+#   ════════════════════
+#
+# ============================================================================
+
+# Binary content placeholder

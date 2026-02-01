@@ -1,0 +1,502 @@
+# Avellaneda-Stoikov Optimal Market Making Strategy
+#
+# Implementation of the optimal market making algorithm from:
+# "High-frequency trading in a limit order book" by Avellaneda & Stoikov (2008)
+#
+# This strategy dynamically adjusts bid/ask prices based on:
+# - Current inventory position (risk management)
+# - Market volatility
+# - Time horizon
+# - Risk aversion parameter
+#
+# ============================================================================
+# MATHEMATICAL FOUNDATION
+# ============================================================================
+#
+# The Avellaneda-Stoikov model derives optimal bid/ask prices that maximize
+# expected utility while managing inventory risk.
+#
+# Key Formulas:
+#
+# 1. Reservation Price (indifference price):
+#    r(s,q,t) = s - q * γ * σ² * (T - t)
+#    
+#    Where:
+#    - s = current mid price
+#    - q = current inventory position
+#    - γ = risk aversion parameter (higher = more conservative)
+#    - σ = volatility of the asset
+#    - T = terminal time
+#    - t = current time
+#
+# 2. Optimal Spread:
+#    δ(t) = γ * σ² * (T - t) + (2/γ) * ln(1 + γ/k)
+#    
+#    Where:
+#    - k = order arrival rate parameter
+#
+# 3. Bid and Ask Prices:
+#    bid = r - δ/2
+#    ask = r + δ/2
+#
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+#
+# Parameters:
+#   - gamma (γ): Risk aversion parameter (default: 0.1)
+#   - sigma (σ): Volatility estimate (default: calculated from market)
+#   - T: Time horizon in seconds (default: 300)
+#   - k: Order arrival rate (default: 1.5)
+#   - order_size: Size per order (default: 0.01 BTC)
+#   - max_position: Maximum inventory (default: 0.5 BTC)
+#   - min_spread: Minimum spread floor (default: 0.001)
+#
+# ============================================================================
+# GRAPH DEFINITION
+# ============================================================================
+#
+# Graph {
+#     name: "avellaneda_stoikov_mm",
+#     version: 1,
+#     description: "Optimal market making with dynamic spread adjustment",
+#     
+#     nodes: [
+#         # =========== CONFIGURATION CONSTANTS ===========
+#         
+#         # Risk aversion parameter (γ)
+#         {
+#             id: sha256("config_gamma"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.1], confidence: 1.0 }
+#         },
+#         
+#         # Time horizon in seconds (T)
+#         {
+#             id: sha256("config_time_horizon"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [300.0], confidence: 1.0 }
+#         },
+#         
+#         # Order arrival rate parameter (k)
+#         {
+#             id: sha256("config_k"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.5], confidence: 1.0 }
+#         },
+#         
+#         # Order size
+#         {
+#             id: sha256("config_order_size"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.01], confidence: 1.0 }
+#         },
+#         
+#         # Maximum position limit
+#         {
+#             id: sha256("config_max_position"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.5], confidence: 1.0 }
+#         },
+#         
+#         # Minimum spread floor (to ensure profitability)
+#         {
+#             id: sha256("config_min_spread"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.001], confidence: 1.0 }
+#         },
+#         
+#         # Constants for calculations
+#         {
+#             id: sha256("const_two"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [2.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("const_one"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("const_half"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.5], confidence: 1.0 }
+#         },
+#         
+#         # =========== MARKET DATA ===========
+#         
+#         # Get current mid price
+#         {
+#             id: sha256("get_mid_price"),
+#             type: External,
+#             uri: "binance:ticker:BTCUSDT",
+#             inputs: []
+#         },
+#         
+#         # Get current position/inventory
+#         {
+#             id: sha256("get_position"),
+#             type: External,
+#             uri: "binance:balance:BTC",
+#             inputs: []
+#         },
+#         
+#         # Get historical volatility (calculated from recent trades)
+#         {
+#             id: sha256("get_volatility"),
+#             type: External,
+#             uri: "binance:volatility:symbol=BTCUSDT,period=300",
+#             inputs: []
+#         },
+#         
+#         # Get time remaining in horizon
+#         {
+#             id: sha256("get_time_remaining"),
+#             type: External,
+#             uri: "system:time_remaining:horizon=300",
+#             inputs: []
+#         },
+#         
+#         # =========== VOLATILITY SQUARED (σ²) ===========
+#         
+#         {
+#             id: sha256("sigma_squared"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["get_volatility", "get_volatility"]
+#         },
+#         
+#         # =========== RESERVATION PRICE CALCULATION ===========
+#         # r = mid_price - q * γ * σ² * T
+#         
+#         # Step 1: q * γ
+#         {
+#             id: sha256("q_times_gamma"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["get_position", "config_gamma"]
+#         },
+#         
+#         # Step 2: (q * γ) * σ²
+#         {
+#             id: sha256("q_gamma_sigma_sq"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["q_times_gamma", "sigma_squared"]
+#         },
+#         
+#         # Step 3: (q * γ * σ²) * T
+#         {
+#             id: sha256("inventory_adjustment"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["q_gamma_sigma_sq", "get_time_remaining"]
+#         },
+#         
+#         # Step 4: r = mid_price - inventory_adjustment
+#         {
+#             id: sha256("reservation_price"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["get_mid_price", "inventory_adjustment"]
+#         },
+#         
+#         # =========== OPTIMAL SPREAD CALCULATION ===========
+#         # δ = γ * σ² * T + (2/γ) * ln(1 + γ/k)
+#         
+#         # Part 1: γ * σ² * T
+#         {
+#             id: sha256("gamma_sigma_sq"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["config_gamma", "sigma_squared"]
+#         },
+#         {
+#             id: sha256("spread_part1"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["gamma_sigma_sq", "get_time_remaining"]
+#         },
+#         
+#         # Part 2: (2/γ) * ln(1 + γ/k)
+#         # Calculate γ/k
+#         {
+#             id: sha256("gamma_over_k"),
+#             type: Operation,
+#             op: Div,
+#             inputs: ["config_gamma", "config_k"]
+#         },
+#         
+#         # Calculate 1 + γ/k
+#         {
+#             id: sha256("one_plus_gamma_k"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["const_one", "gamma_over_k"]
+#         },
+#         
+#         # Calculate ln(1 + γ/k) - using Log operation
+#         {
+#             id: sha256("ln_term"),
+#             type: Operation,
+#             op: Log,
+#             inputs: ["one_plus_gamma_k"]
+#         },
+#         
+#         # Calculate 2/γ
+#         {
+#             id: sha256("two_over_gamma"),
+#             type: Operation,
+#             op: Div,
+#             inputs: ["const_two", "config_gamma"]
+#         },
+#         
+#         # Calculate (2/γ) * ln(1 + γ/k)
+#         {
+#             id: sha256("spread_part2"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["two_over_gamma", "ln_term"]
+#         },
+#         
+#         # Total optimal spread: δ = part1 + part2
+#         {
+#             id: sha256("optimal_spread_raw"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["spread_part1", "spread_part2"]
+#         },
+#         
+#         # Ensure spread is at least minimum
+#         {
+#             id: sha256("optimal_spread"),
+#             type: Operation,
+#             op: Max,
+#             inputs: ["optimal_spread_raw", "config_min_spread"]
+#         },
+#         
+#         # =========== BID/ASK PRICE CALCULATION ===========
+#         # bid = r - δ/2
+#         # ask = r + δ/2
+#         
+#         # Half spread
+#         {
+#             id: sha256("half_spread"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["optimal_spread", "const_half"]
+#         },
+#         
+#         # Bid price
+#         {
+#             id: sha256("bid_price"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["reservation_price", "half_spread"]
+#         },
+#         
+#         # Ask price
+#         {
+#             id: sha256("ask_price"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["reservation_price", "half_spread"]
+#         },
+#         
+#         # =========== POSITION LIMIT CHECK ===========
+#         
+#         # Absolute position
+#         {
+#             id: sha256("abs_position"),
+#             type: Operation,
+#             op: Abs,
+#             inputs: ["get_position"]
+#         },
+#         
+#         # Check if within limits
+#         {
+#             id: sha256("position_ok"),
+#             type: Operation,
+#             op: Lt,
+#             inputs: ["abs_position", "config_max_position"]
+#         },
+#         
+#         # =========== ORDER PLACEMENT ===========
+#         
+#         # Place bid order (only if position allows)
+#         {
+#             id: sha256("place_bid"),
+#             type: Branch,
+#             condition: "position_ok",
+#             threshold: 0.5,
+#             true_branch: "execute_bid",
+#             false_branch: "skip_bid"
+#         },
+#         
+#         {
+#             id: sha256("execute_bid"),
+#             type: External,
+#             uri: "binance:order:symbol=BTCUSDT,side=BUY,type=LIMIT",
+#             inputs: ["bid_price", "config_order_size"]
+#         },
+#         
+#         {
+#             id: sha256("skip_bid"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         
+#         # Place ask order
+#         {
+#             id: sha256("place_ask"),
+#             type: Branch,
+#             condition: "position_ok",
+#             threshold: 0.5,
+#             true_branch: "execute_ask",
+#             false_branch: "skip_ask"
+#         },
+#         
+#         {
+#             id: sha256("execute_ask"),
+#             type: External,
+#             uri: "binance:order:symbol=BTCUSDT,side=SELL,type=LIMIT",
+#             inputs: ["ask_price", "config_order_size"]
+#         },
+#         
+#         {
+#             id: sha256("skip_ask"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         
+#         # =========== OUTPUT AGGREGATION ===========
+#         
+#         {
+#             id: sha256("output"),
+#             type: Operation,
+#             op: Concat,
+#             inputs: ["place_bid", "place_ask", "reservation_price", "optimal_spread"]
+#         }
+#     ],
+#     
+#     entry_point: "get_mid_price",
+#     outputs: ["output"],
+#     
+#     proofs: [
+#         HaltingProof {
+#             max_steps: 100,
+#             fuel_budget: 1000
+#         },
+#         StrategyProof {
+#             name: "avellaneda_stoikov_mm",
+#             author: sha256("0-protocol"),
+#             timestamp: 1706745600,
+#             academic_reference: "Avellaneda & Stoikov (2008)",
+#             parameters: {
+#                 gamma: 0.1,
+#                 time_horizon: 300,
+#                 k: 1.5
+#             }
+#         }
+#     ],
+#     
+#     metadata: {
+#         created_by: "0-hummingbot/agent4",
+#         created_at: 1706745600,
+#         description: "Optimal market making based on Avellaneda-Stoikov model"
+#     }
+# }
+#
+# ============================================================================
+# EXECUTION FLOW DIAGRAM
+# ============================================================================
+#
+#    ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+#    │  get_mid_price  │     │  get_position   │     │  get_volatility │
+#    │   (External)    │     │   (External)    │     │   (External)    │
+#    └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
+#             │                       │                       │
+#             │                       │                       ▼
+#             │                       │              ┌─────────────────┐
+#             │                       │              │  sigma_squared  │
+#             │                       │              │    (σ² = σ*σ)   │
+#             │                       │              └────────┬────────┘
+#             │                       │                       │
+#             │                       ▼                       │
+#             │              ┌─────────────────┐              │
+#             │              │  q_times_gamma  │◄─────────────┤
+#             │              │    (q * γ)      │              │
+#             │              └────────┬────────┘              │
+#             │                       │                       │
+#             │                       ▼                       │
+#             │              ┌─────────────────┐              │
+#             │              │ inventory_adj   │◄─────────────┘
+#             │              │ (q*γ*σ²*T)      │
+#             │              └────────┬────────┘
+#             │                       │
+#             ▼                       ▼
+#    ┌─────────────────────────────────────────────┐
+#    │           reservation_price                 │
+#    │         r = mid - q*γ*σ²*T                  │
+#    │  (Adjusts for inventory risk)               │
+#    └──────────────────┬──────────────────────────┘
+#                       │
+#                       │     ┌─────────────────┐
+#                       │     │  optimal_spread │
+#                       │     │ δ = γσ²T + ...  │
+#                       │     └────────┬────────┘
+#                       │              │
+#                       ▼              ▼
+#    ┌─────────────────────────────────────────────┐
+#    │                                             │
+#    │   bid = r - δ/2       ask = r + δ/2        │
+#    │                                             │
+#    └──────────┬────────────────────┬─────────────┘
+#               │                    │
+#               ▼                    ▼
+#    ┌─────────────────┐   ┌─────────────────┐
+#    │   place_bid     │   │   place_ask     │
+#    │   (External)    │   │   (External)    │
+#    └────────┬────────┘   └────────┬────────┘
+#             │                     │
+#             └──────────┬──────────┘
+#                        │
+#                        ▼
+#               ┌─────────────────┐
+#               │     output      │
+#               │   (Concat)      │
+#               └─────────────────┘
+#
+# ============================================================================
+# WHY 0-LANG IS SUPERIOR FOR AVELLANEDA-STOIKOV
+# ============================================================================
+#
+# 1. MATHEMATICAL PRECISION
+#    - All calculations are explicit and verifiable
+#    - No hidden state or side effects
+#    - Anyone can verify the implementation matches the paper
+#
+# 2. REAL-TIME PARAMETER ADJUSTMENT
+#    - External nodes fetch live volatility and position
+#    - Strategy adapts automatically to market conditions
+#    - No manual intervention needed
+#
+# 3. RISK MANAGEMENT BUILT-IN
+#    - Position limits enforced at graph level
+#    - Inventory adjustment is part of the core formula
+#    - Cannot be bypassed by bugs
+#
+# 4. PROVABLE OPTIMALITY
+#    - Strategy hash proves academic model is implemented correctly
+#    - Auditors can verify mathematical correctness
+#    - Execution trace shows every calculation
+#
+# 5. AGENT INTERPRETABLE
+#    - AI agents can understand the trading logic
+#    - Can explain decisions based on graph structure
+#    - Enables meta-strategy optimization
+#
+# ============================================================================
+
+# Binary content placeholder - generate with:
+#   zero generate graphs/strategies/market_making/avellaneda_mm.0

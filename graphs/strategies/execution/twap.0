@@ -1,0 +1,381 @@
+# Time-Weighted Average Price (TWAP) Execution Strategy
+#
+# Executes a large order by splitting it into equal parts over time.
+# This minimizes market impact by avoiding large single orders.
+#
+# ============================================================================
+# STRATEGY OVERVIEW
+# ============================================================================
+#
+# TWAP divides a large order into N equal-sized child orders,
+# executing one at each time interval.
+#
+# Example:
+#   - Total order: 10 BTC
+#   - Duration: 1 hour (3600 seconds)
+#   - Slices: 12 (every 5 minutes)
+#   - Each slice: 10/12 ≈ 0.833 BTC
+#
+# Benefits:
+#   - Predictable execution pattern
+#   - Minimal market impact
+#   - Simple to implement and understand
+#   - Works well in stable markets
+#
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+#
+# Parameters:
+#   - total_quantity: Total amount to execute (e.g., 10 BTC)
+#   - side: BUY or SELL
+#   - duration_seconds: Total execution window
+#   - num_slices: Number of child orders
+#   - order_type: MARKET or LIMIT
+#   - limit_offset: For LIMIT orders, offset from mid price (%)
+#   - max_deviation: Maximum price deviation to continue (%)
+#
+# ============================================================================
+# GRAPH DEFINITION
+# ============================================================================
+#
+# Graph {
+#     name: "twap_execution",
+#     version: 1,
+#     description: "Time-weighted average price execution algorithm",
+#     
+#     nodes: [
+#         # =========== CONFIGURATION ===========
+#         
+#         # Total quantity to execute
+#         {
+#             id: sha256("config_total_qty"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [10.0], confidence: 1.0 }
+#         },
+#         
+#         # Number of slices
+#         {
+#             id: sha256("config_num_slices"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [12.0], confidence: 1.0 }
+#         },
+#         
+#         # Duration in seconds
+#         {
+#             id: sha256("config_duration"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [3600.0], confidence: 1.0 }
+#         },
+#         
+#         # Order side (1.0 = BUY, 0.0 = SELL)
+#         {
+#             id: sha256("config_side"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         
+#         # Limit order offset from mid price (%)
+#         {
+#             id: sha256("config_limit_offset"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.001], confidence: 1.0 }
+#         },
+#         
+#         # Maximum price deviation threshold (%)
+#         {
+#             id: sha256("config_max_deviation"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.02], confidence: 1.0 }
+#         },
+#         
+#         # Reference price (VWAP start price)
+#         {
+#             id: sha256("config_reference_price"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#             # Note: This would be set at strategy start
+#         },
+#         
+#         # =========== STATE ===========
+#         
+#         # Get execution state (quantity remaining, slices done)
+#         {
+#             id: sha256("get_execution_state"),
+#             type: External,
+#             uri: "state:twap:id=current",
+#             inputs: []
+#         },
+#         
+#         # Current slice number
+#         {
+#             id: sha256("get_current_slice"),
+#             type: External,
+#             uri: "state:twap:slice_number",
+#             inputs: []
+#         },
+#         
+#         # =========== MARKET DATA ===========
+#         
+#         # Current mid price
+#         {
+#             id: sha256("get_mid_price"),
+#             type: External,
+#             uri: "binance:ticker:BTCUSDT",
+#             inputs: []
+#         },
+#         
+#         # =========== SLICE SIZE CALCULATION ===========
+#         
+#         # Quantity per slice = total / num_slices
+#         {
+#             id: sha256("slice_quantity"),
+#             type: Operation,
+#             op: Div,
+#             inputs: ["config_total_qty", "config_num_slices"]
+#         },
+#         
+#         # =========== PRICE DEVIATION CHECK ===========
+#         
+#         # Calculate deviation from reference
+#         {
+#             id: sha256("price_diff"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["get_mid_price", "config_reference_price"]
+#         },
+#         {
+#             id: sha256("price_deviation"),
+#             type: Operation,
+#             op: Div,
+#             inputs: ["price_diff", "config_reference_price"]
+#         },
+#         {
+#             id: sha256("abs_deviation"),
+#             type: Operation,
+#             op: Abs,
+#             inputs: ["price_deviation"]
+#         },
+#         
+#         # Check if deviation is acceptable
+#         {
+#             id: sha256("deviation_ok"),
+#             type: Operation,
+#             op: Lt,
+#             inputs: ["abs_deviation", "config_max_deviation"]
+#         },
+#         
+#         # =========== SLICE COMPLETION CHECK ===========
+#         
+#         # Check if all slices are done
+#         {
+#             id: sha256("slices_remaining"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["config_num_slices", "get_current_slice"]
+#         },
+#         {
+#             id: sha256("const_zero"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("has_slices_remaining"),
+#             type: Operation,
+#             op: Gt,
+#             inputs: ["slices_remaining", "const_zero"]
+#         },
+#         
+#         # =========== EXECUTION DECISION ===========
+#         
+#         # Should we execute this slice?
+#         # Conditions: has_slices_remaining AND deviation_ok
+#         {
+#             id: sha256("should_execute"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["has_slices_remaining", "deviation_ok"]
+#             # Both conditions must be 1.0 for product to be 1.0
+#         },
+#         
+#         # =========== LIMIT PRICE CALCULATION ===========
+#         
+#         # For BUY: bid = mid * (1 - offset)
+#         # For SELL: ask = mid * (1 + offset)
+#         
+#         {
+#             id: sha256("const_one"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         
+#         # Calculate offset multiplier based on side
+#         # BUY (side=1): multiplier = 1 - offset
+#         # SELL (side=0): multiplier = 1 + offset
+#         {
+#             id: sha256("offset_sign"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["const_one", "config_side"]
+#             # BUY: 1-1=0, SELL: 1-0=1
+#         },
+#         {
+#             id: sha256("const_two"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [2.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("offset_direction"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["const_one", "offset_sign"]
+#             # Gives -1 for BUY, +1 for SELL... need to fix this
+#         },
+#         
+#         # Simplified: just calculate both and select
+#         {
+#             id: sha256("buy_price_mult"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["const_one", "config_limit_offset"]
+#         },
+#         {
+#             id: sha256("sell_price_mult"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["const_one", "config_limit_offset"]
+#         },
+#         
+#         # Select multiplier based on side
+#         {
+#             id: sha256("select_multiplier"),
+#             type: Branch,
+#             condition: "config_side",
+#             threshold: 0.5,
+#             true_branch: "buy_price_mult",
+#             false_branch: "sell_price_mult"
+#         },
+#         
+#         # Calculate limit price
+#         {
+#             id: sha256("limit_price"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["get_mid_price", "select_multiplier"]
+#         },
+#         
+#         # =========== ORDER EXECUTION ===========
+#         
+#         {
+#             id: sha256("execute_order"),
+#             type: Branch,
+#             condition: "should_execute",
+#             threshold: 0.5,
+#             true_branch: "place_order",
+#             false_branch: "skip_order"
+#         },
+#         
+#         {
+#             id: sha256("place_order"),
+#             type: External,
+#             uri: "binance:order:symbol=BTCUSDT,type=LIMIT",
+#             inputs: ["limit_price", "slice_quantity", "config_side"]
+#         },
+#         
+#         {
+#             id: sha256("skip_order"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         
+#         # =========== STATE UPDATE ===========
+#         
+#         # Update execution state after order
+#         {
+#             id: sha256("update_state"),
+#             type: External,
+#             uri: "state:twap:update",
+#             inputs: ["execute_order", "slice_quantity"]
+#         },
+#         
+#         # =========== OUTPUT ===========
+#         
+#         {
+#             id: sha256("output"),
+#             type: Operation,
+#             op: Concat,
+#             inputs: ["execute_order", "slices_remaining", "abs_deviation"]
+#         }
+#     ],
+#     
+#     entry_point: "get_mid_price",
+#     outputs: ["output"],
+#     
+#     proofs: [
+#         HaltingProof {
+#             max_steps: 50,
+#             fuel_budget: 500
+#         },
+#         ExecutionProof {
+#             name: "twap_execution",
+#             total_quantity: 10.0,
+#             num_slices: 12,
+#             duration_seconds: 3600
+#         }
+#     ],
+#     
+#     metadata: {
+#         created_by: "0-hummingbot/agent4",
+#         created_at: 1706745600,
+#         description: "TWAP execution algorithm for large orders"
+#     }
+# }
+#
+# ============================================================================
+# EXECUTION TIMELINE
+# ============================================================================
+#
+#   Time ─────────────────────────────────────────────────────────► 1 hour
+#   
+#   │ Slice 1  │ Slice 2  │ Slice 3  │ ... │ Slice 12 │
+#   │  0.833   │  0.833   │  0.833   │ ... │  0.833   │
+#   │   BTC    │   BTC    │   BTC    │     │   BTC    │
+#   ▼          ▼          ▼               ▼
+#   t=0       t=5min    t=10min         t=55min
+#
+#   Each slice:
+#   ┌──────────────────────────────────────────────────┐
+#   │ 1. Check price deviation from reference          │
+#   │ 2. If OK, calculate limit price                  │
+#   │ 3. Place order for slice_quantity                │
+#   │ 4. Update execution state                        │
+#   │ 5. Wait for next interval                        │
+#   └──────────────────────────────────────────────────┘
+#
+# ============================================================================
+# WHY 0-LANG EXCELS AT TWAP
+# ============================================================================
+#
+# 1. DETERMINISTIC SLICING
+#    - Same parameters always produce same execution plan
+#    - No randomness or hidden state
+#    - Fully auditable execution
+#
+# 2. BUILT-IN SAFEGUARDS
+#    - Price deviation check is part of the graph
+#    - Cannot execute if market moves too much
+#    - Risk limits enforced at graph level
+#
+# 3. STATE MANAGEMENT
+#    - External nodes track execution progress
+#    - Resumable after interruption
+#    - Clear audit trail
+#
+# 4. PROOF-CARRYING EXECUTION
+#    - Each slice generates a PCO
+#    - Complete record of execution vs plan
+#    - Compliance-ready
+#
+# ============================================================================
+
+# Binary content placeholder

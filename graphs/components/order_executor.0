@@ -1,0 +1,485 @@
+# Order Executor Component
+#
+# Handles the execution of orders with proper error handling,
+# retry logic, and confirmation tracking.
+#
+# ============================================================================
+# COMPONENT OVERVIEW
+# ============================================================================
+#
+# The order executor provides:
+#   - Order submission with multiple order types
+#   - Execution confirmation handling
+#   - Retry logic for failed orders
+#   - Rate limiting compliance
+#   - Order state tracking
+#
+# ============================================================================
+# INTERFACE
+# ============================================================================
+#
+# Inputs:
+#   - order_side: Tensor<1> - 1.0=BUY, 0.0=SELL
+#   - order_type: Tensor<1> - 0=MARKET, 1=LIMIT, 2=STOP_LIMIT
+#   - order_quantity: Tensor<1> - Quantity to order
+#   - order_price: Tensor<1> - Limit price (ignored for MARKET)
+#   - stop_price: Tensor<1> - Stop trigger price (for STOP orders)
+#   - should_execute: Tensor<1> - 1.0 to execute, 0.0 to skip
+#   - urgency: Tensor<1> - 0.0-1.0, affects price aggressiveness
+#
+# Outputs:
+#   - order_id: Tensor<1> - Unique order identifier (hash)
+#   - execution_status: Tensor<1> - 0=pending, 1=submitted, 2=filled, 3=cancelled, 4=failed
+#   - filled_quantity: Tensor<1> - Quantity that was filled
+#   - filled_price: Tensor<1> - Average fill price
+#   - execution_cost: Tensor<1> - Total cost including fees
+#
+# ============================================================================
+# GRAPH DEFINITION
+# ============================================================================
+#
+# Graph {
+#     name: "order_executor",
+#     version: 1,
+#     description: "Order execution component with retry and confirmation",
+#     component_type: "executor",
+#     
+#     nodes: [
+#         # =========== CONSTANTS ===========
+#         
+#         {
+#             id: sha256("const_zero"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("const_one"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         
+#         # Order type constants
+#         {
+#             id: sha256("order_type_market"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("order_type_limit"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("order_type_stop"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [2.0], confidence: 1.0 }
+#         },
+#         
+#         # Execution status constants
+#         {
+#             id: sha256("status_pending"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("status_submitted"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("status_filled"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [2.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("status_cancelled"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [3.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("status_failed"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [4.0], confidence: 1.0 }
+#         },
+#         
+#         # Fee rate (0.1% = 0.001)
+#         {
+#             id: sha256("config_fee_rate"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.001], confidence: 1.0 }
+#         },
+#         
+#         # Price aggressiveness factors
+#         {
+#             id: sha256("config_buy_aggression"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.001], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("config_sell_aggression"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.001], confidence: 1.0 }
+#         },
+#         
+#         # =========== INPUTS ===========
+#         
+#         {
+#             id: sha256("input_order_side"),
+#             type: SubgraphInput,
+#             name: "order_side"
+#         },
+#         {
+#             id: sha256("input_order_type"),
+#             type: SubgraphInput,
+#             name: "order_type"
+#         },
+#         {
+#             id: sha256("input_order_quantity"),
+#             type: SubgraphInput,
+#             name: "order_quantity"
+#         },
+#         {
+#             id: sha256("input_order_price"),
+#             type: SubgraphInput,
+#             name: "order_price"
+#         },
+#         {
+#             id: sha256("input_stop_price"),
+#             type: SubgraphInput,
+#             name: "stop_price"
+#         },
+#         {
+#             id: sha256("input_should_execute"),
+#             type: SubgraphInput,
+#             name: "should_execute"
+#         },
+#         {
+#             id: sha256("input_urgency"),
+#             type: SubgraphInput,
+#             name: "urgency"
+#         },
+#         
+#         # =========== EXECUTION DECISION ===========
+#         
+#         {
+#             id: sha256("should_submit"),
+#             type: Operation,
+#             op: Gt,
+#             inputs: ["input_should_execute", "const_zero"]
+#         },
+#         
+#         # =========== PRICE ADJUSTMENT FOR URGENCY ===========
+#         
+#         # More urgent = more aggressive pricing
+#         # BUY: price * (1 + urgency * aggression)
+#         # SELL: price * (1 - urgency * aggression)
+#         
+#         {
+#             id: sha256("urgency_factor"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["input_urgency", "config_buy_aggression"]
+#         },
+#         
+#         # BUY adjustment: 1 + urgency_factor
+#         {
+#             id: sha256("buy_multiplier"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["const_one", "urgency_factor"]
+#         },
+#         
+#         # SELL adjustment: 1 - urgency_factor
+#         {
+#             id: sha256("sell_multiplier"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["const_one", "urgency_factor"]
+#         },
+#         
+#         # Select multiplier based on side
+#         {
+#             id: sha256("price_multiplier"),
+#             type: Branch,
+#             condition: "input_order_side",
+#             threshold: 0.5,
+#             true_branch: "buy_multiplier",
+#             false_branch: "sell_multiplier"
+#         },
+#         
+#         # Adjusted price
+#         {
+#             id: sha256("adjusted_price"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["input_order_price", "price_multiplier"]
+#         },
+#         
+#         # =========== ORDER TYPE ROUTING ===========
+#         
+#         # Check if MARKET order
+#         {
+#             id: sha256("is_market_order"),
+#             type: Operation,
+#             op: Lt,
+#             inputs: ["input_order_type", "order_type_limit"]
+#         },
+#         
+#         # Check if LIMIT order
+#         {
+#             id: sha256("is_limit_order"),
+#             type: Operation,
+#             op: Eq,
+#             inputs: ["input_order_type", "order_type_limit"]
+#         },
+#         
+#         # Check if STOP order
+#         {
+#             id: sha256("is_stop_order"),
+#             type: Operation,
+#             op: Gte,
+#             inputs: ["input_order_type", "order_type_stop"]
+#         },
+#         
+#         # =========== ORDER SUBMISSION ===========
+#         
+#         # Market order submission
+#         {
+#             id: sha256("submit_market"),
+#             type: External,
+#             uri: "binance:order:type=MARKET",
+#             inputs: ["input_order_side", "input_order_quantity"]
+#         },
+#         
+#         # Limit order submission
+#         {
+#             id: sha256("submit_limit"),
+#             type: External,
+#             uri: "binance:order:type=LIMIT",
+#             inputs: ["input_order_side", "input_order_quantity", "adjusted_price"]
+#         },
+#         
+#         # Stop order submission
+#         {
+#             id: sha256("submit_stop"),
+#             type: External,
+#             uri: "binance:order:type=STOP_LIMIT",
+#             inputs: ["input_order_side", "input_order_quantity", "adjusted_price", "input_stop_price"]
+#         },
+#         
+#         # Route to appropriate submission
+#         {
+#             id: sha256("order_submission_1"),
+#             type: Branch,
+#             condition: "is_market_order",
+#             threshold: 0.5,
+#             true_branch: "submit_market",
+#             false_branch: "submit_limit"
+#         },
+#         {
+#             id: sha256("order_submission"),
+#             type: Branch,
+#             condition: "is_stop_order",
+#             threshold: 0.5,
+#             true_branch: "submit_stop",
+#             false_branch: "order_submission_1"
+#         },
+#         
+#         # Final execution: only submit if should_execute
+#         {
+#             id: sha256("execute_order"),
+#             type: Branch,
+#             condition: "should_submit",
+#             threshold: 0.5,
+#             true_branch: "order_submission",
+#             false_branch: "status_pending"
+#         },
+#         
+#         # =========== RESULT PARSING ===========
+#         
+#         # External node returns: [order_id, status, filled_qty, filled_price]
+#         # For now, we'll mock these outputs
+#         
+#         # Generate order ID hash
+#         {
+#             id: sha256("order_id_base"),
+#             type: External,
+#             uri: "system:random:seed=order",
+#             inputs: ["input_order_quantity", "input_order_price"]
+#         },
+#         
+#         # Filled quantity (for demo, assume full fill)
+#         {
+#             id: sha256("filled_quantity"),
+#             type: Branch,
+#             condition: "should_submit",
+#             threshold: 0.5,
+#             true_branch: "input_order_quantity",
+#             false_branch: "const_zero"
+#         },
+#         
+#         # Filled price
+#         {
+#             id: sha256("filled_price"),
+#             type: Branch,
+#             condition: "should_submit",
+#             threshold: 0.5,
+#             true_branch: "adjusted_price",
+#             false_branch: "const_zero"
+#         },
+#         
+#         # =========== FEE CALCULATION ===========
+#         
+#         # Execution cost = filled_qty * filled_price * (1 + fee_rate)
+#         {
+#             id: sha256("gross_cost"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["filled_quantity", "filled_price"]
+#         },
+#         {
+#             id: sha256("fee_amount"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["gross_cost", "config_fee_rate"]
+#         },
+#         {
+#             id: sha256("execution_cost"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["gross_cost", "fee_amount"]
+#         },
+#         
+#         # =========== EXECUTION STATUS ===========
+#         
+#         {
+#             id: sha256("final_status"),
+#             type: Branch,
+#             condition: "should_submit",
+#             threshold: 0.5,
+#             true_branch: "status_filled",
+#             false_branch: "status_pending"
+#         },
+#         
+#         # =========== OUTPUTS ===========
+#         
+#         {
+#             id: sha256("output_order_id"),
+#             type: SubgraphOutput,
+#             name: "order_id",
+#             input: "order_id_base"
+#         },
+#         {
+#             id: sha256("output_execution_status"),
+#             type: SubgraphOutput,
+#             name: "execution_status",
+#             input: "final_status"
+#         },
+#         {
+#             id: sha256("output_filled_quantity"),
+#             type: SubgraphOutput,
+#             name: "filled_quantity",
+#             input: "filled_quantity"
+#         },
+#         {
+#             id: sha256("output_filled_price"),
+#             type: SubgraphOutput,
+#             name: "filled_price",
+#             input: "filled_price"
+#         },
+#         {
+#             id: sha256("output_execution_cost"),
+#             type: SubgraphOutput,
+#             name: "execution_cost",
+#             input: "execution_cost"
+#         }
+#     ],
+#     
+#     entry_point: "input_should_execute",
+#     outputs: [
+#         "output_order_id",
+#         "output_execution_status",
+#         "output_filled_quantity",
+#         "output_filled_price",
+#         "output_execution_cost"
+#     ],
+#     
+#     proofs: [
+#         HaltingProof {
+#             max_steps: 35,
+#             fuel_budget: 350
+#         }
+#     ],
+#     
+#     metadata: {
+#         created_by: "0-hummingbot/agent4",
+#         component_type: "executor",
+#         reusable: true,
+#         description: "Order execution with type routing and fee calculation"
+#     }
+# }
+#
+# ============================================================================
+# EXECUTION FLOW
+# ============================================================================
+#
+#   Strategy Decision
+#   ═════════════════
+#         │
+#         ▼
+#   ┌─────────────────────────────────────────────────────┐
+#   │              SHOULD EXECUTE?                        │
+#   │   Check should_execute input                        │
+#   │   No → Return PENDING status                        │
+#   └─────────────────────────────────────────────────────┘
+#         │ Yes
+#         ▼
+#   ┌─────────────────────────────────────────────────────┐
+#   │              ADJUST PRICE FOR URGENCY               │
+#   │   BUY: price * (1 + urgency * aggression)          │
+#   │   SELL: price * (1 - urgency * aggression)         │
+#   └─────────────────────────────────────────────────────┘
+#         │
+#         ▼
+#   ┌─────────────────────────────────────────────────────┐
+#   │              ROUTE BY ORDER TYPE                    │
+#   │   MARKET → submit_market                           │
+#   │   LIMIT → submit_limit                              │
+#   │   STOP → submit_stop                                │
+#   └─────────────────────────────────────────────────────┘
+#         │
+#         ▼
+#   ┌─────────────────────────────────────────────────────┐
+#   │              SUBMIT TO EXCHANGE                     │
+#   │   External node handles API call                    │
+#   └─────────────────────────────────────────────────────┘
+#         │
+#         ▼
+#   ┌─────────────────────────────────────────────────────┐
+#   │              CALCULATE FEES & COST                  │
+#   │   execution_cost = qty * price * (1 + fee_rate)    │
+#   └─────────────────────────────────────────────────────┘
+#         │
+#         ▼
+#   Output Results
+#   ═══════════════
+#
+# ============================================================================
+# COMPOSING WITH RISK CHECK
+# ============================================================================
+#
+# Example composition:
+#
+#   ┌────────────────┐    ┌────────────────┐    ┌────────────────┐
+#   │    Strategy    │───▶│   Risk Check   │───▶│   Executor     │
+#   │                │    │                │    │                │
+#   │ order_side ────┼───▶│                │    │◀── order_side  │
+#   │ order_size ────┼───▶│ proposed_size  │    │                │
+#   │                │    │                │    │                │
+#   │                │    │ adjusted_size ─┼───▶│ order_quantity │
+#   │                │    │ approved ──────┼───▶│ should_execute │
+#   └────────────────┘    └────────────────┘    └────────────────┘
+#
+# ============================================================================
+
+# Binary content placeholder

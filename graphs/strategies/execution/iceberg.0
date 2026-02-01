@@ -1,0 +1,414 @@
+# Iceberg Order Execution Strategy
+#
+# Hides large orders by only showing a small "tip" at a time.
+# As each visible portion fills, a new one is automatically placed.
+#
+# ============================================================================
+# STRATEGY OVERVIEW
+# ============================================================================
+#
+# Iceberg orders solve the problem of revealing intent:
+#   - A 100 BTC order on the book signals large buying interest
+#   - Other traders may front-run or adjust prices
+#   - Iceberg shows only 1 BTC at a time, hiding the 99 BTC
+#
+# How it works:
+#   1. Place small "display" order
+#   2. When filled, immediately place another
+#   3. Repeat until total quantity is executed
+#
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+#
+# Parameters:
+#   - total_quantity: Total amount to execute (hidden)
+#   - display_quantity: Visible order size (the "tip")
+#   - side: BUY or SELL
+#   - limit_price: Target execution price
+#   - price_tolerance: How far price can move before pausing
+#   - randomize: Add variance to display size (anti-detection)
+#
+# ============================================================================
+# GRAPH DEFINITION
+# ============================================================================
+#
+# Graph {
+#     name: "iceberg_execution",
+#     version: 1,
+#     description: "Hidden large order execution via small visible portions",
+#     
+#     nodes: [
+#         # =========== CONFIGURATION ===========
+#         
+#         # Total hidden quantity
+#         {
+#             id: sha256("config_total_qty"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [100.0], confidence: 1.0 }
+#         },
+#         
+#         # Display quantity (visible tip)
+#         {
+#             id: sha256("config_display_qty"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         
+#         # Side (1.0 = BUY, 0.0 = SELL)
+#         {
+#             id: sha256("config_side"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         
+#         # Target limit price
+#         {
+#             id: sha256("config_limit_price"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [50000.0], confidence: 1.0 }
+#         },
+#         
+#         # Price tolerance (% from limit before pausing)
+#         {
+#             id: sha256("config_price_tolerance"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.005], confidence: 1.0 }
+#         },
+#         
+#         # Randomization range (% variance in display size)
+#         {
+#             id: sha256("config_random_range"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.2], confidence: 1.0 }
+#         },
+#         
+#         # =========== STATE ===========
+#         
+#         # Quantity filled so far
+#         {
+#             id: sha256("get_filled_qty"),
+#             type: External,
+#             uri: "state:iceberg:filled_quantity",
+#             inputs: []
+#         },
+#         
+#         # Current active order status
+#         {
+#             id: sha256("get_active_order"),
+#             type: External,
+#             uri: "state:iceberg:active_order",
+#             inputs: []
+#         },
+#         
+#         # =========== MARKET DATA ===========
+#         
+#         {
+#             id: sha256("get_mid_price"),
+#             type: External,
+#             uri: "binance:ticker:BTCUSDT",
+#             inputs: []
+#         },
+#         
+#         {
+#             id: sha256("get_best_bid"),
+#             type: External,
+#             uri: "binance:orderbook:BTCUSDT:best_bid",
+#             inputs: []
+#         },
+#         
+#         {
+#             id: sha256("get_best_ask"),
+#             type: External,
+#             uri: "binance:orderbook:BTCUSDT:best_ask",
+#             inputs: []
+#         },
+#         
+#         # =========== REMAINING QUANTITY ===========
+#         
+#         {
+#             id: sha256("remaining_qty"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["config_total_qty", "get_filled_qty"]
+#         },
+#         
+#         {
+#             id: sha256("const_zero"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("has_remaining"),
+#             type: Operation,
+#             op: Gt,
+#             inputs: ["remaining_qty", "const_zero"]
+#         },
+#         
+#         # =========== DISPLAY SIZE CALCULATION ===========
+#         
+#         # Add randomization to avoid detection
+#         # display_size = base * (1 + random(-range, +range))
+#         
+#         {
+#             id: sha256("get_random"),
+#             type: External,
+#             uri: "system:random:min=-1,max=1",
+#             inputs: []
+#         },
+#         
+#         {
+#             id: sha256("random_factor"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["get_random", "config_random_range"]
+#         },
+#         
+#         {
+#             id: sha256("const_one"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [1.0], confidence: 1.0 }
+#         },
+#         {
+#             id: sha256("size_multiplier"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["const_one", "random_factor"]
+#         },
+#         
+#         {
+#             id: sha256("randomized_display"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["config_display_qty", "size_multiplier"]
+#         },
+#         
+#         # Clamp to remaining quantity
+#         {
+#             id: sha256("actual_display_qty"),
+#             type: Operation,
+#             op: Min,
+#             inputs: ["randomized_display", "remaining_qty"]
+#         },
+#         
+#         # =========== PRICE CHECK ===========
+#         
+#         # For BUY: check if best_ask <= limit_price * (1 + tolerance)
+#         # For SELL: check if best_bid >= limit_price * (1 - tolerance)
+#         
+#         {
+#             id: sha256("price_upper_mult"),
+#             type: Operation,
+#             op: Add,
+#             inputs: ["const_one", "config_price_tolerance"]
+#         },
+#         {
+#             id: sha256("price_upper_bound"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["config_limit_price", "price_upper_mult"]
+#         },
+#         
+#         {
+#             id: sha256("price_lower_mult"),
+#             type: Operation,
+#             op: Sub,
+#             inputs: ["const_one", "config_price_tolerance"]
+#         },
+#         {
+#             id: sha256("price_lower_bound"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["config_limit_price", "price_lower_mult"]
+#         },
+#         
+#         # BUY price ok: best_ask <= upper_bound
+#         {
+#             id: sha256("buy_price_ok"),
+#             type: Operation,
+#             op: Lte,
+#             inputs: ["get_best_ask", "price_upper_bound"]
+#         },
+#         
+#         # SELL price ok: best_bid >= lower_bound
+#         {
+#             id: sha256("sell_price_ok"),
+#             type: Operation,
+#             op: Gte,
+#             inputs: ["get_best_bid", "price_lower_bound"]
+#         },
+#         
+#         # Select based on side
+#         {
+#             id: sha256("price_ok"),
+#             type: Branch,
+#             condition: "config_side",
+#             threshold: 0.5,
+#             true_branch: "buy_price_ok",
+#             false_branch: "sell_price_ok"
+#         },
+#         
+#         # =========== ORDER STATUS CHECK ===========
+#         
+#         # Check if we need to place new order
+#         # Need order if: no active order OR active order filled
+#         {
+#             id: sha256("need_new_order"),
+#             type: Operation,
+#             op: Lt,
+#             inputs: ["get_active_order", "const_one"]
+#             # active_order = 0 means no order, = 1 means pending
+#         },
+#         
+#         # =========== EXECUTION DECISION ===========
+#         
+#         # Should place: has_remaining AND price_ok AND need_new_order
+#         {
+#             id: sha256("cond_1"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["has_remaining", "price_ok"]
+#         },
+#         {
+#             id: sha256("should_place"),
+#             type: Operation,
+#             op: Mul,
+#             inputs: ["cond_1", "need_new_order"]
+#         },
+#         
+#         # =========== ORDER EXECUTION ===========
+#         
+#         {
+#             id: sha256("execute_order"),
+#             type: Branch,
+#             condition: "should_place",
+#             threshold: 0.5,
+#             true_branch: "place_order",
+#             false_branch: "wait"
+#         },
+#         
+#         {
+#             id: sha256("place_order"),
+#             type: External,
+#             uri: "binance:order:symbol=BTCUSDT,type=LIMIT",
+#             inputs: ["config_limit_price", "actual_display_qty", "config_side"]
+#         },
+#         
+#         {
+#             id: sha256("wait"),
+#             type: Constant,
+#             value: Tensor { shape: [1], data: [0.0], confidence: 1.0 }
+#         },
+#         
+#         # =========== STATE UPDATE ===========
+#         
+#         {
+#             id: sha256("update_state"),
+#             type: External,
+#             uri: "state:iceberg:update",
+#             inputs: ["execute_order", "actual_display_qty"]
+#         },
+#         
+#         # =========== PROGRESS CALCULATION ===========
+#         
+#         {
+#             id: sha256("progress_pct"),
+#             type: Operation,
+#             op: Div,
+#             inputs: ["get_filled_qty", "config_total_qty"]
+#         },
+#         
+#         # =========== OUTPUT ===========
+#         
+#         {
+#             id: sha256("output"),
+#             type: Operation,
+#             op: Concat,
+#             inputs: ["execute_order", "remaining_qty", "progress_pct", "actual_display_qty"]
+#         }
+#     ],
+#     
+#     entry_point: "get_mid_price",
+#     outputs: ["output"],
+#     
+#     proofs: [
+#         HaltingProof {
+#             max_steps: 60,
+#             fuel_budget: 600
+#         },
+#         ExecutionProof {
+#             name: "iceberg_execution",
+#             total_quantity: 100.0,
+#             display_quantity: 1.0,
+#             concealment_ratio: 100
+#         }
+#     ],
+#     
+#     metadata: {
+#         created_by: "0-hummingbot/agent4",
+#         created_at: 1706745600,
+#         description: "Iceberg order execution hiding large orders"
+#     }
+# }
+#
+# ============================================================================
+# ICEBERG VISUALIZATION
+# ============================================================================
+#
+#   Order Book (what others see)    Actual Order (hidden)
+#   ═══════════════════════════     ════════════════════
+#   
+#   ASK Side:                       Total: 100 BTC
+#   $50,100  |█████ 5.0             Filled: 45 BTC
+#   $50,050  |███ 3.0               Remaining: 55 BTC
+#   ─────────────────────           Display: 1 BTC
+#   $50,000  |█ 1.0 ← Your iceberg
+#   ─────────────────────           [█████████░░░░░░░░░░░]
+#   BID Side:                          45%    Progress
+#   $49,950  |████ 4.0
+#   $49,900  |██████ 6.0
+#   
+#   The market sees 1 BTC.
+#   Your algorithm manages 100 BTC.
+#
+# ============================================================================
+# ANTI-DETECTION FEATURES
+# ============================================================================
+#
+# 1. RANDOMIZED SIZE
+#    - Display quantity varies ±20%
+#    - Prevents pattern recognition
+#    - Each "tip" looks different
+#
+# 2. DYNAMIC TIMING
+#    - Refill only when previous fills
+#    - No fixed interval patterns
+#    - Mimics natural order flow
+#
+# 3. PRICE ADAPTATION
+#    - Pauses if price moves unfavorably
+#    - Resumes when price returns
+#    - Doesn't chase the market
+#
+# ============================================================================
+# WHY 0-LANG IS IDEAL FOR ICEBERG
+# ============================================================================
+#
+# 1. STATE MANAGEMENT
+#    - Clear tracking of hidden vs shown
+#    - External nodes maintain fill state
+#    - Resumable across sessions
+#
+# 2. DETERMINISTIC REFILL
+#    - Same conditions → same behavior
+#    - No race conditions
+#    - Provable execution
+#
+# 3. CONCEALMENT PROOF
+#    - Can prove display/total ratio
+#    - Audit trail of all refills
+#    - Compliance documentation
+#
+# ============================================================================
+
+# Binary content placeholder
