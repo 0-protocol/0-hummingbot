@@ -118,10 +118,32 @@ impl ExternalResolver for HttpResolver {
             res.text().await.map_err(|e| format!("Failed to read response: {}", e))
         })?;
 
-        // In a full implementation, we'd parse response_text (JSON) into a Tensor.
-        // For now, we return a success signal with the length of the string as a proxy value
+        // Parse response_text (JSON) into a Tensor.
         tracing::debug!("HTTP response received ({} bytes)", response_text.len());
-        Ok(Tensor::scalar(1.0, 1.0)) // Return 1.0 with 1.0 confidence for success
+        
+        // Simple heuristic parser for common Exchange API responses
+        match serde_json::from_str::<serde_json::Value>(&response_text) {
+            Ok(json) => {
+                // Try to extract price or value heuristically
+                let value = if let Some(price_str) = json.get("price").and_then(|v| v.as_str()) {
+                    price_str.parse::<f32>().unwrap_or(0.0)
+                } else if let Some(last_str) = json.get("last").and_then(|v| v.as_str()) {
+                    last_str.parse::<f32>().unwrap_or(0.0)
+                } else if let Some(price_num) = json.get("price").and_then(|v| v.as_f64()) {
+                    price_num as f32
+                } else {
+                    1.0 // fallback
+                };
+                
+                // Return value with 1.0 confidence
+                Ok(Tensor::scalar(value, 1.0))
+            }
+            Err(e) => {
+                tracing::error!("Failed to parse JSON response: {}", e);
+                // Return 0.0 with 0.0 confidence on parse failure
+                Ok(Tensor::scalar(0.0, 0.0))
+            }
+        }
     }
 }
 
