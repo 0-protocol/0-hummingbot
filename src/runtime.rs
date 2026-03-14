@@ -43,9 +43,8 @@ impl TradingRuntime {
     }
 
     /// Load a strategy graph from file
-    pub fn load_strategy(&self, _path: &Path) -> Result<RuntimeGraph, String> {
-        // TODO: Implement graph loading from .0 files
-        Err("Graph loading not yet implemented".to_string())
+    pub fn load_strategy(&self, path: &Path) -> Result<RuntimeGraph, String> {
+        RuntimeGraph::load_from_file(path).map_err(|e| format!("Failed to load graph: {:?}", e))
     }
 
     /// Execute a single iteration of the strategy
@@ -69,15 +68,32 @@ impl TradingRuntime {
         println!("│  Status: Runtime loop not yet implemented                   │");
         println!("└─────────────────────────────────────────────────────────────┘");
 
-        // TODO: Implement the execution loop
-        // 1. Load strategy graph
-        // 2. Fetch market data
-        // 3. Execute graph
-        // 4. Process decision tensor
-        // 5. Place orders if confidence > threshold
-        // 6. Sleep for interval
-        // 7. Repeat
+        let graph_path = Path::new(&self.config.strategy_path);
+        let graph = self.load_strategy(graph_path)?;
 
+        println!("✅ Strategy loaded successfully.");
+        println!("⏳ Entering execution loop...");
+
+        loop {
+            // Execute the graph for this iteration
+            match self.execute_once(&graph) {
+                Ok(tensors) => {
+                    if !tensors.is_empty() {
+                        let decision = &tensors[0];
+                        println!("⚡ Decision emitted: {:?}", decision);
+                    } else {
+                        println!("⚡ Graph executed successfully, no output tensor.");
+                    }
+                }
+                Err(e) => {
+                    println!("❌ Execution error: {}", e);
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(self.config.interval_ms));
+        }
+
+        #[allow(unreachable_code)]
         Ok(())
     }
 }
