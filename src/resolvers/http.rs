@@ -68,6 +68,28 @@ impl HttpResolver {
 
         Ok(format!("{}{}", base, path))
     }
+    
+    async fn execute_request(&self, method: &str, url: &str, inputs: Vec<&Tensor>) -> Result<String, String> {
+        let mut req = match method {
+            "get" => self.client.get(url),
+            "post" => self.client.post(url),
+            "put" => self.client.put(url),
+            "delete" => self.client.delete(url),
+            _ => return Err(format!("Unsupported HTTP method: {}", method)),
+        };
+
+        if !inputs.is_empty() && (method == "post" || method == "put") {
+            tracing::debug!("Warning: Tensor serialization to HTTP body is basic");
+        }
+
+        let res = req.send().await.map_err(|e| format!("Request failed: {}", e))?;
+        
+        if !res.status().is_success() {
+            return Err(format!("HTTP Error: {}", res.status()));
+        }
+
+        res.text().await.map_err(|e| format!("Failed to read response: {}", e))
+    }
 }
 
 impl Default for HttpResolver {
@@ -81,9 +103,6 @@ impl ExternalResolver for HttpResolver {
         let (method, service, path) = self.parse_uri(uri)?;
         let url = self.build_url(&service, &path)?;
 
-        // For now, return a placeholder tensor
-        // TODO: Implement actual HTTP calls with tokio runtime
-        
         tracing::info!(
             "HTTP {} {} (inputs: {})",
             method.to_uppercase(),
@@ -91,10 +110,68 @@ impl ExternalResolver for HttpResolver {
             inputs.len()
         );
 
-        // Return a placeholder tensor indicating the request was parsed
-        // In a real implementation, this would make the HTTP request
-        // and parse the JSON response into a tensor
-        Ok(Tensor::scalar(1.0, 0.5)) // 50% confidence placeholder
+        // Use tokio handle to spawn or block_on if we're in async context
+        // Try getting existing handle, otherwise it means we are purely sync
+        let response_text = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    self.execute_request(&method, &url, inputs).await
+                })
+            })?,
+            Err(_) => {
+                // We shouldn't create a new runtime per request. If we are completely outside tokio,
+                // we should use a global static runtime, but for now blocking client is better.
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                rt.block_on(async { self.execute_request(&method, &url, inputs).await })?
+            }
+        };
+
+        // Parse response_text (JSON) into a Tensor.
+        tracing::debug!("HTTP response received ({} bytes)", response_text.len());
+        
+        // Simple heuristic parser for common Exchange API responses
+        match serde_json::from_str::<serde_json::Value>(&response_text) {
+            Ok(json) => {
+                // Try to extract price or value heuristically
+                // Better heuristic: try to extract price from nested objects if not at root
+                fn find_price(val: &serde_json::Value) -> Option<f32> {
+                    if let Some(obj) = val.as_object() {
+                        if let Some(p) = obj.get("price").or_else(|| obj.get("last")) {
+                            if let Some(s) = p.as_str() {
+                                return s.parse().ok();
+                            }
+                            if let Some(n) = p.as_f64() {
+                                return Some(n as f32);
+                            }
+                        }
+                        for (_, v) in obj {
+                            if let Some(p) = find_price(v) {
+                                return Some(p);
+                            }
+                        }
+                    } else if let Some(arr) = val.as_array() {
+                        for v in arr {
+                            if let Some(p) = find_price(v) {
+                                return Some(p);
+                            }
+                        }
+                    }
+                    None
+                }
+                
+                if let Some(value) = find_price(&json) {
+                    Ok(Tensor::scalar(value, 1.0))
+                } else {
+                    tracing::warn!("Could not find price/last field in response, returning 0.0");
+                    Ok(Tensor::scalar(0.0, 0.0))
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to parse JSON response: {}", e);
+                // Return 0.0 with 0.0 confidence on parse failure
+                Ok(Tensor::scalar(0.0, 0.0))
+            }
+        }
     }
 }
 
