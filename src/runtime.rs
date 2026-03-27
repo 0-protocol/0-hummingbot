@@ -74,26 +74,43 @@ impl TradingRuntime {
         println!("✅ Strategy loaded successfully.");
         println!("⏳ Entering execution loop...");
 
+        // Setup graceful shutdown channel
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        
+        // Spawn a task to listen for ctrl-c
+        tokio::spawn(async move {
+            if let Ok(_) = tokio::signal::ctrl_c().await {
+                let _ = shutdown_tx.send(true);
+            }
+        });
+
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(self.config.interval_ms));
+
         loop {
-            // Execute the graph for this iteration
-            match self.execute_once(&graph) {
-                Ok(tensors) => {
-                    if !tensors.is_empty() {
-                        let decision = &tensors[0];
-                        println!("⚡ Decision emitted: {:?}", decision);
-                    } else {
-                        println!("⚡ Graph executed successfully, no output tensor.");
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    println!("🛑 Graceful shutdown initiated");
+                    break;
+                }
+                _ = interval.tick() => {
+                    // Execute the graph for this iteration
+                    match self.execute_once(&graph) {
+                        Ok(tensors) => {
+                            if !tensors.is_empty() {
+                                let decision = &tensors[0];
+                                println!("⚡ Decision emitted: {:?}", decision);
+                            } else {
+                                println!("⚡ Graph executed successfully, no output tensor.");
+                            }
+                        }
+                        Err(e) => {
+                            println!("❌ Execution error: {}", e);
+                        }
                     }
                 }
-                Err(e) => {
-                    println!("❌ Execution error: {}", e);
-                }
             }
-
-            std::thread::sleep(std::time::Duration::from_millis(self.config.interval_ms));
         }
 
-        #[allow(unreachable_code)]
         Ok(())
     }
 }
